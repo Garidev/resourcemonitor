@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 nsis
+          rustup target add x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generate icon
+        run: python3 tools/gen_icon.py
+
+      - name: Build release binaries
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Package installer
+        run: |
+          mkdir -p dist
+          makensis installer/resmon.nsi
+
+      - name: Upload unsigned installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ResourceMonitorSetup-unsigned
+          path: dist/ResourceMonitorSetup.exe
+
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    # Inert until the SIGNPATH_* secrets are configured (see docs/signing.md).
+    if: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+    steps:
+      - name: Download unsigned installer
+        uses: actions/download-artifact@v4
+        with:
+          name: ResourceMonitorSetup-unsigned
+          path: dist
+
+      # Placeholder: once the SignPath application is approved, their
+      # dashboard generates an exact workflow snippet (org/project/policy
+      # slugs, input names) for this project — paste it in here rather than
+      # trusting the field names below, which are illustrative only.
+      - name: Submit for signing
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: "${{ secrets.SIGNPATH_API_TOKEN }}"
+          organization-id: "${{ secrets.SIGNPATH_ORGANIZATION_ID }}"
+          project-slug: "resource-monitor"
+          signing-policy-slug: "release-signing"
+          artifact-configuration-slug: "installer"
+          path-to-artifact: "dist/ResourceMonitorSetup.exe"
+          wait-for-completion: true
+          output-artifact-directory: dist-signed
+
+      - name: Upload signed installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ResourceMonitorSetup-signed
+          path: dist-signed/ResourceMonitorSetup.exe
+
+  release:
+    needs: [build, sign]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download signed installer (if available)
+        uses: actions/download-artifact@v4
+        with:
+          name: ResourceMonitorSetup-signed
+          path: dist
+        continue-on-error: true
+
+      - name: Download unsigned installer (fallback)
+        if: ${{ !hashFiles('dist/ResourceMonitorSetup.exe') }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ResourceMonitorSetup-unsigned
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ResourceMonitorSetup.exe
+          generate_release_notes: true
