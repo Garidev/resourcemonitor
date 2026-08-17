@@ -221,6 +221,23 @@ pub fn make_font(height: i32, weight: i32) -> HFONT {
     }
 }
 
+/// A geometric pen with round caps and joins. `CreatePen` can express neither:
+/// it always mitres, which on a 14 px chevron produces a visibly pointed,
+/// off-centre corner, and leaves stroke ends square where every glyph in this
+/// set wants them round.
+fn round_pen(width: i32, color: u32) -> HPEN {
+    let brush = LOGBRUSH { lbStyle: BS_SOLID, lbColor: color, lbHatch: 0 };
+    unsafe {
+        ExtCreatePen(
+            (PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND) as u32,
+            width.max(1) as u32,
+            &brush,
+            0,
+            std::ptr::null(),
+        )
+    }
+}
+
 /// Letter-spacing for the two steps that carry it, in design px before scale.
 /// `SetTextCharacterExtra` is the only tracking GDI offers and it is integral,
 /// so these are already rounded to what the call can express.
@@ -557,7 +574,7 @@ pub fn chevron(dc: HDC, cx: i32, cy: i32, size: i32, thickness: i32, color: u32,
         POINT { x: cx + dx, y: cy + half },
     ];
     unsafe {
-        let pen = CreatePen(PS_SOLID as i32, thickness.max(1), color);
+        let pen = round_pen(thickness.max(1), color);
         let old = SelectObject(dc, pen as HGDIOBJ);
         Polyline(dc, pts.as_ptr(), pts.len() as i32);
         SelectObject(dc, old);
@@ -624,7 +641,7 @@ pub fn icon(dc: HDC, cx: i32, cy: i32, size: i32, thickness: i32, color: u32, su
     let un = |v: f32| (v * u).round() as i32;
     let th = thickness.max(1);
     unsafe {
-        let pen = CreatePen(PS_SOLID as i32, th, color);
+        let pen = round_pen(th, color);
         let old_pen = SelectObject(dc, pen as HGDIOBJ);
         let hollow = GetStockObject(NULL_BRUSH) as HGDIOBJ;
         let solid = CreateSolidBrush(color);
@@ -779,7 +796,7 @@ pub fn metric_icon(dc: HDC, cx: i32, cy: i32, size: i32, thickness: i32, color: 
     let u = size.max(8) as f32 / 16.0;
     let p = |x: f32, y: f32| POINT { x: cx + (x * u).round() as i32, y: cy + (y * u).round() as i32 };
     unsafe {
-        let pen = CreatePen(PS_SOLID as i32, thickness.max(1), color);
+        let pen = round_pen(thickness.max(1), color);
         let old_pen = SelectObject(dc, pen as HGDIOBJ);
         let hollow = SelectObject(dc, GetStockObject(NULL_BRUSH) as HGDIOBJ);
         let solid = CreateSolidBrush(color);
@@ -903,7 +920,7 @@ pub fn arrow(dc: HDC, cx: i32, cy: i32, size: i32, thickness: i32, color: u32, d
     let stem = [px(0.0, -0.825), px(0.0, 0.55)];
     let head = [px(-0.475, 0.1125), px(0.0, 0.725), px(0.475, 0.1125)];
     unsafe {
-        let pen = CreatePen(PS_SOLID as i32, thickness.max(1), color);
+        let pen = round_pen(thickness.max(1), color);
         let old = SelectObject(dc, pen as HGDIOBJ);
         Polyline(dc, stem.as_ptr(), stem.len() as i32);
         Polyline(dc, head.as_ptr(), head.len() as i32);
@@ -919,6 +936,16 @@ pub fn arrow(dc: HDC, cx: i32, cy: i32, size: i32, thickness: i32, color: u32, d
 pub fn centre_y(dc: HDC, font: HFONT, mid: i32) -> i32 {
     let (asc, desc, ilead) = text_metrics(dc, font);
     mid - ilead - (asc + desc - ilead) / 2
+}
+
+/// Like [`centre_y`], but centres the **cap box** rather than the full font
+/// cell. An all-caps run uses none of its descent, so centring ascent+descent
+/// sits the letters visibly low next to a geometrically centred icon.
+pub fn centre_y_caps(dc: HDC, font: HFONT, mid: i32) -> i32 {
+    let (asc, _, ilead) = text_metrics(dc, font);
+    let cap = asc - ilead;
+    // baseline = mid + cap/2, and the call takes the top of the cell.
+    mid + cap / 2 - asc
 }
 
 /// The `y` so the run's descender lands `gap` px above `bottom`.
@@ -972,7 +999,7 @@ pub fn disclosure(dc: HDC, cx: i32, cy: i32, size: i32, thickness: i32, color: u
         ]
     };
     unsafe {
-        let pen = CreatePen(PS_SOLID as i32, thickness.max(1), color);
+        let pen = round_pen(thickness.max(1), color);
         let old = SelectObject(dc, pen as HGDIOBJ);
         Polyline(dc, pts.as_ptr(), pts.len() as i32);
         SelectObject(dc, old);
@@ -1070,6 +1097,27 @@ pub fn aa_disc(surf: &Surface, clip: &RECT, cx: f32, cy: f32, r: f32, color: u32
     }
 }
 
+/// How a chart's own labels — peak, ceiling — should format a value. Without
+/// this a rate's peak label printed the raw byte count.
+#[derive(Copy, Clone, PartialEq)]
+pub enum Units {
+    Percent,
+    /// Bytes per second, formatted like every other rate in the product.
+    Rate,
+    /// A bare count, e.g. frames per second.
+    Count,
+}
+
+impl Units {
+    pub fn fmt(self, v: f32) -> String {
+        match self {
+            Units::Percent => format!("{:.0}%", v),
+            Units::Rate => crate::util::format_rate(v.max(0.0) as u64),
+            Units::Count => format!("{:.0}", v),
+        }
+    }
+}
+
 /// Where a chart is drawn and how much of it there is room for.
 #[derive(Copy, Clone, PartialEq)]
 pub enum ChartSize {
@@ -1111,6 +1159,7 @@ pub fn chart(
     scale: f32,
     hover: Option<usize>,
     font_micro: Option<HFONT>,
+    units: Units,
 ) {
     let cap = ring.capacity();
     let (w, h) = (r.right - r.left, r.bottom - r.top);
@@ -1134,7 +1183,10 @@ pub fn chart(
         let shade_to = px(0).floor() as i32;
         if shade_to > r.left {
             let g = RECT { left: r.left, top: r.top, right: shade_to, bottom: r.bottom };
-            fill(dc, &g, mix(t().card, t().bg, 0.5));
+            // A hint that the window is still filling, not a slab across it:
+            // at a half mix this read as a dark box that dominated the plot on
+            // every fresh start.
+            fill(dc, &g, mix(t().card, t().bg, 0.22));
         }
     }
 
@@ -1258,7 +1310,7 @@ pub fn chart(
             let tick = RECT { left: hx, top: hy - 3, right: hx + 1, bottom: hy + 4 };
             fill(dc, &tick, t().dim);
             if let Some(f) = font_micro {
-                let label = format!("peak {}", fmt_ceiling(pv, ceiling));
+                let label = format!("peak {}", units.fmt(pv));
                 let w = text_width(dc, f, &label);
                 // Whichever side has room; a label that runs off the plate is
                 // worse than one on the unexpected side.
@@ -1276,24 +1328,20 @@ pub fn chart(
         aa_disc(s, r, hx, hy, rad, color);
     }
 
+    // Ceiling label, top-right — *on* the line it describes. Below the plot it
+    // sat next to the baseline and read as though the axis bottomed out at
+    // 100 %, which is the opposite of what it means.
+    if size == ChartSize::Hero {
+        if let Some(f) = font_micro {
+            text_right(dc, r.right, r.top, f, t().dim, &units.fmt(ceiling));
+        }
+    }
+
     // 7. Head dot: the entire motion language for "live".
     if let (Some(s), Some(&(hx, hy))) = (surf, pts.last()) {
         let rad = 2.5 * scale.max(1.0);
         aa_disc(s, r, hx, hy, rad + 1.0, t().card);
         aa_disc(s, r, hx, hy, rad, color);
-    }
-}
-
-/// Format a chart value against its ceiling. Percent ceilings mean percent
-/// values; anything else is a rate or a byte count and is left to the caller's
-/// units, so this only has to be right about the percent case.
-fn fmt_ceiling(v: f32, ceiling: f32) -> String {
-    if (ceiling - 100.0).abs() < 0.01 {
-        format!("{:.0}%", v)
-    } else if v >= 100.0 {
-        format!("{:.0}", v)
-    } else {
-        format!("{:.1}", v)
     }
 }
 

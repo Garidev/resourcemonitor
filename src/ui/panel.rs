@@ -118,6 +118,10 @@ enum View {
 enum Action {
     Drill(Metric),
     Back,
+    /// Hover-only: a core cell in the CPU grid. Exists so the cell participates
+    /// in hit testing — which is what drives a repaint on mouse move — without
+    /// doing anything when clicked.
+    HoverCore,
     OpenSettings,
     TogglePin,
     /// Dismiss the flyout (the × in the header strip).
@@ -250,6 +254,9 @@ pub struct Ui {
     /// state. Press is new: the panel previously gave no feedback at all
     /// between hover and whatever the click did.
     pressed: bool,
+    /// Measured height of the drill-down hero plate, including the gap below
+    /// it. Zero until the first paint.
+    hero_h: i32,
     /// The live hover cross-fade: the rect being left, the rect being entered,
     /// and progress from 0 to 1. Either rect may be empty, meaning the cursor
     /// came from or went to nothing.
@@ -620,6 +627,7 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         hist_net: Ring::new(60),
         surf: None,
         pressed: false,
+        hero_h: 0,
         fade: None,
         fade_timer: false,
         core_hist: Vec::new(),
@@ -1549,7 +1557,7 @@ impl Ui {
         gdi::text_t(
             dc,
             tx,
-            gdi::centre_y(dc, self.fonts.label, mid),
+            gdi::centre_y_caps(dc, self.fonts.label, mid),
             self.fonts.label,
             track,
             accent,
@@ -1633,20 +1641,37 @@ impl Ui {
         let Some(sub) = &f.sub else { return };
         let suw = self.unit_w(dc, f.sub_unit);
         let sy = gdi::bottom_y(dc, self.fonts.micro, card.bottom, self.s(SP1));
+        let sub_ink = if f.sub_is_figure { gdi::t().dim } else { gdi::t().mute };
         gdi::text_right_t(
             dc,
             right - suw,
             sy,
             self.fonts.micro,
             self.s(gdi::TRACK_MICRO),
-            gdi::t().mute,
+            sub_ink,
             sub,
         );
-        if f.sub_unit != Unit::None {
-            let smid = gdi::centre_y(dc, self.fonts.micro, 0);
-            // centre_y(…, 0) is the offset from a midline to the cell top, so
-            // subtracting it from sy recovers the midline this run sits on.
-            self.draw_marker(dc, right - suw + self.s(SP2), sy - smid, self.s(MARKER_SM), f.sub_unit);
+        match f.sub_unit {
+            Unit::None => {}
+            // The noun after a secondary figure stays `mute` while the figure
+            // itself is `dim`: `290 KB/s` has to be readable, `write` does not.
+            Unit::Word(w) => {
+                gdi::text_t(
+                    dc,
+                    right - suw + self.s(SP2),
+                    sy,
+                    self.fonts.micro,
+                    self.s(gdi::TRACK_MICRO),
+                    gdi::t().mute,
+                    w,
+                );
+            }
+            u => {
+                let smid = gdi::centre_y(dc, self.fonts.micro, 0);
+                // centre_y(…, 0) is the offset from a midline to the cell top,
+                // so subtracting it from sy recovers this run's midline.
+                self.draw_marker(dc, right - suw + self.s(SP2), sy - smid, self.s(MARKER_SM), u);
+            }
         }
     }
 
@@ -1687,6 +1712,10 @@ impl Ui {
             return;
         };
         match a {
+            // Hover-only; clicking a core does nothing. Per-core *usage* per
+            // process would need ETW context-switch tracing, so there is no
+            // honest drill-down to offer here.
+            Action::HoverCore => {}
             Action::Drill(m) => {
                 // Keep any entered filter text — it persists until cleared.
                 self.navigate(hwnd, View::Drill(m));
@@ -2831,10 +2860,10 @@ impl Ui {
         let fps_figs = match (&s.fps, s.etw_ok) {
             (Some((_, name, fps)), _) => Figures::new(fps.to_string())
                 .unit(Unit::Word("fps"))
-                .sub(format!("in {}", name), Unit::None),
+                .note(format!("in {}", name)),
             (None, true) => Figures::new("—".to_string()),
             (None, false) => Figures::new("—".to_string())
-                .sub("run as administrator to see".to_string(), Unit::None),
+                .note("run as administrator to see".to_string()),
         };
         let ram_figs = {
             let f = Figures::new(format_bytes(s.mem_used)).unit(Unit::Word("used"));
@@ -2868,7 +2897,7 @@ impl Ui {
                 Action::Drill(Metric::Disk),
                 Figures::new(format_rate(s.disk_read_bps))
                     .unit(Unit::Word("read"))
-                    .sub(format!("{} write", format_rate(s.disk_write_bps)), Unit::None),
+                    .sub(format_rate(s.disk_write_bps), Unit::Word("write")),
                 &self.hist_disk,
                 Scale::Rate,
             ),
@@ -2947,6 +2976,7 @@ impl Ui {
                 self.scale,
                 None,
                 None,
+                chart_units(scale),
             );
             self.hits.push((row, action));
             y += self.s(ROW_METRIC);
@@ -3619,10 +3649,14 @@ impl Ui {
         self.s(40 + 10)
     }
 
-    /// Height of the drill-down's hero plate, or 0 for the metrics that have no
-    /// history worth plotting large.
+    /// Height of the drill-down's hero plate plus the gap below it.
+    ///
+    /// Measured during the paint and cached, because the callers that need it
+    /// for layout — `filter_input_y`, and through it the EDIT child's position —
+    /// have no device context to measure with. The fallback only applies to the
+    /// very first paint.
     fn hero_h(&self) -> i32 {
-        self.s(HERO_H + SP4)
+        if self.hero_h > 0 { self.hero_h } else { self.s(HERO_H_GUESS + SP4) }
     }
 
     /// The ring, accent and scale behind a metric's hero chart.
@@ -3645,7 +3679,17 @@ impl Ui {
     /// is asked; `14:22:07` does not.
     fn draw_hero(&mut self, dc: HDC, rc: &RECT, y: i32, m: Metric) -> i32 {
         let pad = self.s(SP4);
-        let plate = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + self.s(HERO_H) };
+        // Everything below is laid out from measured text, so the plate is
+        // exactly as tall as its contents need and the plot cannot escape it.
+        let (d_asc, d_desc, _) = gdi::text_metrics(dc, self.fonts.display);
+        let (l_asc, l_desc, _) = gdi::text_metrics(dc, self.fonts.label);
+        let (m_asc, m_desc, _) = gdi::text_metrics(dc, self.fonts.micro);
+        let head_h = self.s(SP3) + (l_asc + l_desc) + self.s(SP1) + (d_asc + d_desc);
+        let plot_h = self.s(HERO_PLOT_H);
+        let plate_h =
+            head_h + self.s(SP4) + plot_h + self.s(SP1) + (m_asc + m_desc) + self.s(SP3);
+        self.hero_h = plate_h + self.s(SP4);
+        let plate = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + plate_h };
         gdi::card(dc, &plate, gdi::t().card, gdi::t().line, self.s(RADIUS));
 
         let (ring, accent, scale, kind) = self.hero_series(m);
@@ -3655,11 +3699,12 @@ impl Ui {
         let ceiling = scale.ceiling(ring.max(), sticky);
         let latest = ring.iter().last().unwrap_or(0.0);
 
+        let plot_top = plate.top + head_h + self.s(SP4);
         let plot = RECT {
             left: plate.left + self.s(SP4),
-            top: plate.top + self.s(44),
+            top: plot_top,
             right: plate.right - self.s(SP4),
-            bottom: plate.top + self.s(44) + self.s(HERO_PLOT_H),
+            bottom: plot_top + plot_h,
         };
 
         // Which sample the cursor is over, if any. `hover_pos` is already
@@ -3696,7 +3741,7 @@ impl Ui {
         gdi::text(
             dc,
             plate.left + self.s(SP4),
-            plate.top + self.s(SP5) + self.s(SP2),
+            plate.top + self.s(SP3) + (l_asc + l_desc) + self.s(SP1),
             self.fonts.display,
             gdi::t().text,
             &vs,
@@ -3722,6 +3767,7 @@ impl Ui {
             self.scale,
             hit,
             Some(self.fonts.micro),
+            chart_units(scale),
         );
 
         // Window and ceiling labels. The window is derived, not hardcoded —
@@ -3735,19 +3781,6 @@ impl Ui {
             self.s(gdi::TRACK_MICRO),
             gdi::t().mute,
             &format!("{}s", secs),
-        );
-        let ceil_label = match scale {
-            Scale::Percent => "100%".to_string(),
-            _ => format_rate(ceiling as u64),
-        };
-        gdi::text_right_t(
-            dc,
-            plot.right,
-            plot.bottom + self.s(SP1),
-            self.fonts.micro,
-            self.s(gdi::TRACK_MICRO),
-            gdi::t().dim,
-            &ceil_label,
         );
         y + self.hero_h()
     }
@@ -3904,8 +3937,11 @@ impl Ui {
                 let r = RECT { left: bx, top: by, right: bx + bar_w, bottom: by + self.s(SP3) };
                 gdi::bar(dc, &r, pct / 100.0, gdi::acc().cpu);
                 // One pixel per core that turns a snapshot into a window.
+                // Only worth a mark when the peak is meaningfully above the
+                // current fill, and in `dim` rather than `text`: at full ink on
+                // a mostly-empty bar it read as a defect rather than a marker.
                 let peak = self.core_hist.get(i).map(|h| h.max()).unwrap_or(0.0);
-                if peak > 0.5 {
+                if peak > pct + 4.0 {
                     let px = r.left + (((r.right - r.left) as f32) * (peak / 100.0).min(1.0)) as i32;
                     let tick = RECT {
                         left: px.min(r.right - 1),
@@ -3913,16 +3949,26 @@ impl Ui {
                         right: (px + 1).min(r.right),
                         bottom: r.bottom,
                     };
-                    gdi::fill(dc, &tick, gdi::t().text);
+                    gdi::fill(dc, &tick, gdi::t().dim);
                 }
                 // Hover names the core. The grid carries no per-cell labels
                 // otherwise: at four to eight columns there is no room for
                 // sixteen numbers, and unlabelled rules would be decoration.
-                let hit = RECT { left: r.left, top: r.top - self.s(SP1), right: r.right, bottom: r.bottom + self.s(SP1) };
+                let hit = RECT {
+                    left: r.left,
+                    top: r.top - self.s(SP1),
+                    right: r.right,
+                    bottom: r.bottom + self.s(SP1),
+                };
                 if self.hovered(&hit) {
                     readout =
                         Some(format!("core {} · {:.0}% now · {:.0}% peak in 60s", i, pct, peak));
                 }
+                // The cell has to be a hit for the readout to work at all:
+                // WM_MOUSEMOVE only repaints when the hovered hit *index*
+                // changes, so cells outside `hits` never triggered one and the
+                // readout stayed on its placeholder however you moved.
+                self.hits.push((hit, Action::HoverCore));
             }
             let rows_n = (cores.len() as i32 + cols - 1) / cols;
             y += rows_n * self.s(SP4) + self.s(SP1);
@@ -4368,6 +4414,7 @@ impl Ui {
                 self.scale,
                 None,
                 None,
+                chart_units(scale),
             );
             y += self.s(ROW_METRIC);
         }
@@ -5261,6 +5308,17 @@ fn metric_label(name: &str) -> (&'static str, u32, gdi::Glyph) {
     }
 }
 
+/// How a chart should format its own peak and ceiling labels, from the scale
+/// policy that produced the ceiling. Keeping the two derived from one value is
+/// what stops a rate's peak label printing a raw byte count.
+fn chart_units(scale: Scale) -> gdi::Units {
+    match scale {
+        Scale::Percent => gdi::Units::Percent,
+        Scale::Rate => gdi::Units::Rate,
+        Scale::Fps | Scale::Fixed(_) => gdi::Units::Count,
+    }
+}
+
 /// Nominal size of a metric glyph in a row. Design px, before `scale`.
 const GLYPH: i32 = 13;
 
@@ -5277,8 +5335,13 @@ const ID_FADE: usize = 1;
 const FADE_MS: u32 = 16;
 const FADE_TOTAL_MS: f32 = 90.0;
 
-const HERO_H: i32 = 132;
+/// The plot inside the drill-down hero plate. Design px, before scale. The
+/// plate's own height is *derived* from this plus the measured header text — a
+/// fixed plate height and a measured header disagree the moment the type scale
+/// or the DPI changes, and the plot then overflows the card.
 const HERO_PLOT_H: i32 = 72;
+/// Fallback plate height for the first paint, before anything is measured.
+const HERO_H_GUESS: i32 = 172;
 
 /// Nominal size of a direction marker beside a value, and beside a secondary
 /// figure. Design px, before `scale`.
@@ -5305,11 +5368,22 @@ struct Figures {
     unit: Unit,
     sub: Option<String>,
     sub_unit: Unit,
+    /// True when `sub` is a figure rather than prose. A figure is set in `dim`
+    /// so it stays readable; prose — a process name, `of`, `in` — stays `mute`.
+    /// Reported directly: the secondary numbers were too faint to read while
+    /// the words beside them were fine grey.
+    sub_is_figure: bool,
 }
 
 impl Figures {
     fn new(value: String) -> Self {
-        Figures { value, unit: Unit::None, sub: None, sub_unit: Unit::None }
+        Figures {
+            value,
+            unit: Unit::None,
+            sub: None,
+            sub_unit: Unit::None,
+            sub_is_figure: false,
+        }
     }
 
     fn unit(mut self, u: Unit) -> Self {
@@ -5317,9 +5391,20 @@ impl Figures {
         self
     }
 
+    /// A secondary figure: set in `dim`, because it is a number the user reads.
     fn sub(mut self, s: String, u: Unit) -> Self {
         self.sub = Some(s);
         self.sub_unit = u;
+        self.sub_is_figure = true;
+        self
+    }
+
+    /// A secondary line that is prose, not a figure — a process name, or a
+    /// sentence. Stays `mute`.
+    fn note(mut self, s: String) -> Self {
+        self.sub = Some(s);
+        self.sub_unit = Unit::None;
+        self.sub_is_figure = false;
         self
     }
 }
