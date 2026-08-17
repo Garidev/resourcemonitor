@@ -12,7 +12,7 @@ use std::sync::Arc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, EndPaint, IntersectClipRect, InvalidateRect, RestoreDC, SaveDC,
-    ScreenToClient, SetBkColor, SetTextColor, HBRUSH, HDC, PAINTSTRUCT,
+    ScreenToClient, SetBkColor, SetTextColor, HBRUSH, HDC, HFONT, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::NIN_BALLOONUSERCLICK;
@@ -1704,6 +1704,42 @@ impl Ui {
                 // centre_y(…, 0) is the offset from a midline to the cell top,
                 // so subtracting it from sy recovers this run's midline.
                 self.draw_marker(dc, right - suw + self.s(SP2), sy - smid, self.s(MARKER_SM), u);
+            }
+        }
+    }
+
+    /// A unit beside a figure that is *not* in a metric card: a word in
+    /// `micro`/`mute` sharing the figure's baseline, or a direction marker on
+    /// the figure's midline. Same two rules `draw_figures` applies, factored out
+    /// so the list rows cannot drift from the cards — a word and a marker have
+    /// to sit differently, and getting that wrong is invisible until it is a
+    /// unit floating a pixel above its number.
+    ///
+    /// `y` is the cell top of the run the unit follows, and `x` its left edge.
+    fn draw_unit_after(&self, dc: HDC, x: i32, y: i32, font: HFONT, u: Unit) {
+        match u {
+            Unit::None => {}
+            Unit::Word(w) => {
+                // Share the figure's baseline, not its box: the two steps
+                // differ by several pixels of cell, so box-aligning them sits
+                // the unit low.
+                let (vasc, _, _) = gdi::text_metrics(dc, font);
+                let (masc, _, _) = gdi::text_metrics(dc, self.fonts.micro);
+                gdi::text_t(
+                    dc,
+                    x,
+                    y + vasc - masc,
+                    self.fonts.micro,
+                    self.s(gdi::TRACK_MICRO),
+                    gdi::t().mute,
+                    w,
+                );
+            }
+            u => {
+                // centre_y(…, 0) is the offset from a midline to the cell top,
+                // so subtracting it from `y` recovers this run's midline.
+                let mid = y - gdi::centre_y(dc, font, 0);
+                self.draw_marker(dc, x, mid, self.s(MARKER_SM), u);
             }
         }
     }
@@ -3926,8 +3962,9 @@ impl Ui {
             self.snap.clone()
         };
 
-        // Filter row: label + framed input + pause toggle. The EDIT control is
-        // positioned in update_edit at (pad+44, filter_input_y()).
+        // Filter row: framed input + pause toggle. The EDIT child is positioned
+        // in update_edit at (pad + SP3 + GLYPH + SP2, filter_input_y()) — inside
+        // this frame, clear of the magnifier drawn at its left.
         // No "Filter" label: it was 10 px of low-contrast word doing a job the
         // magnifier inside the frame does without costing any field width.
         let top = self.filter_input_y() - self.s(3);
@@ -4067,7 +4104,11 @@ impl Ui {
             return;
         }
         let rows = self.drawn_rows.clone();
-        let row_h = self.s(ROW_LIST);
+        // Disk and Network show both directions, which needs a second line, so
+        // their rows take the taller stride the connections list already uses.
+        // Every other metric is one number and keeps the compact row.
+        let two_way = matches!(metric, Metric::Disk | Metric::Net);
+        let row_h = if two_way { self.s(38) } else { self.s(ROW_LIST) };
         let list_top = y;
         let name_fonts = [self.fonts.body, self.fonts.micro];
         // Clip the scrolling list to its own region so partially scrolled
@@ -4080,28 +4121,65 @@ impl Ui {
                 continue;
             }
             let value = row_value(&snap.procs, name, metric);
+            let pair = row_pair(&snap.procs, name, metric);
+            // The unit that names the primary figure, and the one that names the
+            // secondary. Disk takes words because read and write are not
+            // directions — an arrow beside a read rate would imply the disk is
+            // downloading — and the network takes the direction markers.
+            let (u1, u2) = match (two_way, metric) {
+                (true, Metric::Disk) => (Unit::Word("read"), Unit::Word("write")),
+                (true, _) => (Unit::Down, Unit::Up),
+                _ => (Unit::None, Unit::None),
+            };
             let vs = match metric {
                 Metric::Cpu | Metric::Gpu => format!("{:.1}%", value),
                 Metric::Ram => format_bytes(value as u64),
                 // Sound just lists which apps are playing; a level percentage adds noise.
                 Metric::Audio => String::new(),
-                Metric::Disk | Metric::Net => format_rate(value as u64),
+                // The direction, not the total: a lone rate that could be either
+                // read or write tells you less than the pair does.
+                Metric::Disk | Metric::Net => match pair {
+                    Some((first, _)) => format_rate(first as u64),
+                    None => format_rate(value as u64),
+                },
             };
             let kx = rc.right - pad - self.s(18);
-            let row_bg = RECT { left: pad, top: ry - self.s(2), right: rc.right - pad, bottom: ry + self.s(22) };
+            let row_bg = RECT {
+                left: pad,
+                top: ry - self.s(2),
+                right: rc.right - pad,
+                bottom: ry + if two_way { self.s(32) } else { self.s(22) },
+            };
             if self.hovered(&row_bg) {
                 gdi::fill(dc, &row_bg, gdi::t().card_hover);
             }
+            // The unit is reserved out of the figure column before the value is
+            // placed, so a unit can never push the number under the kill glyph.
+            let u1w = self.unit_w(dc, u1);
             let vw = gdi::text_width(dc, self.fonts.value_sm, &vs);
-            let vx = kx - self.s(10) - vw;
+            let vx = kx - self.s(10) - u1w - vw;
             gdi::text_fit(dc, pad + self.s(4), ry, vx - self.s(8), &name_fonts, gdi::t().text, name);
             gdi::text(dc, vx, ry, self.fonts.value_sm, gdi::t().text, &vs);
+            self.draw_unit_after(dc, vx + vw + self.s(SP2), ry, self.fonts.value_sm, u1);
+            if let Some((_, second)) = pair {
+                // Bottom line of the row, in `micro`. A figure, so it takes
+                // `text` like the value above it and is told apart by size.
+                let ss = format_rate(second as u64);
+                let u2w = self.unit_w(dc, u2);
+                let sw = gdi::text_width(dc, self.fonts.micro, &ss);
+                let sx = kx - self.s(10) - u2w - sw;
+                let sy = ry + self.s(17);
+                gdi::text(dc, sx, sy, self.fonts.micro, gdi::t().text, &ss);
+                self.draw_unit_after(dc, sx + sw + self.s(SP2), sy, self.fonts.micro, u2);
+            }
             self.kill_glyph(dc, kx, ry);
+            // Follows the row's own height, or a two-way row's second line would
+            // sit outside the hit that opens the app it belongs to.
             let name_hit = RECT {
                 left: pad,
                 top: (ry - self.s(2)).max(list_top),
                 right: kx - self.s(6),
-                bottom: ry + self.s(22),
+                bottom: ry + if two_way { self.s(32) } else { self.s(22) },
             };
             self.hits.push((name_hit, Action::Watch(idx)));
             let kill_hit = RECT {
@@ -4177,12 +4255,16 @@ impl Ui {
 
     fn draw_conns(&mut self, dc: HDC, rc: &RECT) {
         let pad = self.s(12);
-        let mut y = pad;
         let title = match &self.conns_for {
             Some(app) => format!("{} connections", app),
             None => "Live connections".to_string(),
         };
-        y = self.header(dc, rc, y, &title, gdi::acc().net);
+        // The y the header hands back is deliberately dropped: the filter frame
+        // below is placed from `filter_input_y()`, and everything under it is
+        // anchored to that frame's own bottom edge, so the header and the field
+        // cannot drift into each other the way they just did.
+        self.header(dc, rc, pad, &title, gdi::acc().net);
+        let mut y;
 
         // Filter row, same geometry as a drill-down's but with no pause
         // toggle: the list is already only as fast as the sweep.
@@ -4190,14 +4272,26 @@ impl Ui {
         // magnifier inside the frame does without costing any field width.
         let top = self.filter_input_y() - self.s(3);
         let frame = RECT {
-            left: pad + self.s(44),
+            // `pad`, exactly as the drill-down's filter does it. This used to be
+            // `pad + s(44)`, which was the inset the removed "Filter" label had
+            // needed. The label went; the inset stayed. The EDIT child is
+            // positioned at `pad + SP3 + GLYPH + SP2` by `update_edit`, so the
+            // frame was starting 19 px to the *right* of its own text and the
+            // placeholder hung out of the left-hand edge.
+            left: pad,
             top,
             right: rc.right - pad,
             bottom: top + self.ctrl_h(),
         };
         gdi::input_frame(dc, &frame);
+        // The magnifier is what earns the removal of the word "Filter", and it
+        // was never drawn here — so this field had neither.
+        self.search_glyph(dc, &frame);
         self.clear_button(dc, &frame);
-        y += self.s(32);
+        // Anchored to the field's own bottom rather than a stride guessed from
+        // the header, so the summary cannot creep back up against it: the old
+        // `s(32)` left 8 px, which read as the empty state touching the box.
+        y = frame.bottom + self.s(SP5);
 
         if self.conns_swept == 0 {
             gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "Collecting connections…");
@@ -4427,7 +4521,9 @@ impl Ui {
             "Disk",
             gdi::acc().disk,
             gdi::Glyph::Disk,
-            Figures::new(format_rate(a.disk_bps)),
+            Figures::new(format_rate(a.disk_read_bps))
+                .unit(Unit::Word("read"))
+                .sub(format_rate(a.disk_write_bps), Unit::Word("write")),
             3,
             Scale::Rate,
         ));
@@ -4435,7 +4531,12 @@ impl Ui {
             "Network",
             gdi::acc().net,
             gdi::Glyph::Net,
-            Figures::new(format_rate(a.net_bps)).unit(Unit::Down),
+            // Was the combined rate wearing a ↓ marker, which named a direction
+            // the number did not have. Both halves are carried now, so each
+            // marker sits on the rate it actually describes.
+            Figures::new(format_rate(a.net_rx_bps))
+                .unit(Unit::Down)
+                .sub(format_rate(a.net_tx_bps), Unit::Up),
             4,
             Scale::Rate,
         ));
@@ -5630,6 +5731,28 @@ fn row_value(procs: &[ProcStat], name: &str, metric: Metric) -> f64 {
         .sum()
 }
 
+/// The two directions of a metric that has two, summed over every process with
+/// this image name: `(read, write)` for disk, `(down, up)` for network. `None`
+/// for the metrics that are a single number.
+///
+/// The list is still ranked by the total from `row_value`, which is the right
+/// ordering — an app writing hard is busy whether or not it reads — so the pair
+/// shown is not always what the row was sorted on. For disk the two also exclude
+/// `other` transfers, so they need not add up to that total and are never
+/// presented as if they do.
+fn row_pair(procs: &[ProcStat], name: &str, metric: Metric) -> Option<(f64, f64)> {
+    let mine = || procs.iter().filter(|p| p.name == name);
+    match metric {
+        Metric::Disk => Some(mine().fold((0.0, 0.0), |(r, w), p| {
+            (r + p.io_read_bps as f64, w + p.io_write_bps as f64)
+        })),
+        Metric::Net => Some(mine().fold((0.0, 0.0), |(d, u), p| {
+            (d + p.net_rx_bps as f64, u + p.net_tx_bps as f64)
+        })),
+        _ => None,
+    }
+}
+
 /// Per-app totals summed over all processes with this image name.
 #[derive(Default, Clone, Copy)]
 struct AppSums {
@@ -5638,7 +5761,11 @@ struct AppSums {
     ram_total: u64,
     gpu: f32,
     disk_bps: u64,
+    disk_read_bps: u64,
+    disk_write_bps: u64,
     net_bps: u64,
+    net_rx_bps: u64,
+    net_tx_bps: u64,
 }
 
 /// Highest FPS among this app's processes (0 when it isn't presenting).
@@ -5659,7 +5786,11 @@ fn watch_sums(procs: &[ProcStat], name: &str) -> AppSums {
         out.ram_total += p.ws_bytes;
         out.gpu += p.gpu_pct;
         out.disk_bps += p.io_bps;
+        out.disk_read_bps += p.io_read_bps;
+        out.disk_write_bps += p.io_write_bps;
         out.net_bps += p.net_bps;
+        out.net_rx_bps += p.net_rx_bps;
+        out.net_tx_bps += p.net_tx_bps;
     }
     out
 }

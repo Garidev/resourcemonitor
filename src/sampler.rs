@@ -46,8 +46,19 @@ pub struct ProcStat {
     pub ws_bytes: u64,
     /// Private working set — what Task Manager's memory column shows.
     pub ws_private: u64,
+    /// Read + write + other transfers. Stays the figure everything sorts and
+    /// alerts on, so splitting the two directions out below changes no ranking.
     pub io_bps: u64,
+    /// The two halves of `io_bps`, for the views that show a direction. `other`
+    /// — named pipes, device control — belongs to neither, so these two do not
+    /// have to add up to `io_bps` and are not presented as if they do.
+    pub io_read_bps: u64,
+    pub io_write_bps: u64,
     pub net_bps: u64,
+    /// The two halves of `net_bps`. Kernel-Network reports sent and received as
+    /// separate events, so this costs nothing to carry.
+    pub net_rx_bps: u64,
+    pub net_tx_bps: u64,
     pub gpu_pct: f32,
     /// Playback level 0..1 for this process (0 = not playing).
     pub audio: f32,
@@ -257,6 +268,8 @@ struct SystemPerfInfoHead {
 struct PidTimes {
     cpu_100ns: u64,
     io_bytes: u64,
+    read_bytes: u64,
+    write_bytes: u64,
 }
 
 pub struct Sampler {
@@ -271,7 +284,8 @@ pub struct Sampler {
     prev_disk_read: u64,
     prev_disk_write: u64,
     prev_pids: HashMap<u32, PidTimes>,
-    pid_net_rates: HashMap<u32, u64>,
+    /// pid -> (received bytes/s, sent bytes/s) for the last tick.
+    pid_net_rates: HashMap<u32, (u64, u64)>,
     pid_gpu: HashMap<u32, f32>,
     name_cache: HashMap<u32, String>,
     proc_buf: Vec<u8>,
@@ -675,11 +689,16 @@ impl Sampler {
         snap.fps = list.iter().find(|e| e.2 >= 5).cloned();
         snap.fps_list = list;
 
-        // Per-pid network bytes since last tick -> rates, folded into procs later.
+        // Per-pid network bytes since last tick -> rates, folded into procs
+        // later. Kept as (received, sent) rather than summed on the way in: the
+        // provider already separates them, and a view that wants to name a
+        // direction cannot recover it from a total.
         let net = std::mem::take(&mut *self.shared.etw.net.lock().unwrap());
         self.pid_net_rates = net
             .into_iter()
-            .map(|(pid, (t, r))| (pid, ((t + r) as f64 / elapsed) as u64))
+            .map(|(pid, (t, r))| {
+                (pid, ((r as f64 / elapsed) as u64, (t as f64 / elapsed) as u64))
+            })
             .collect();
     }
 
@@ -787,9 +806,11 @@ impl Sampler {
             if pid != 0 {
                 let name = unicode_to_string(&info.image_name);
                 let cpu_100ns = (info.kernel_time + info.user_time) as u64;
-                let io_bytes = (info.read_transfer_count
-                    + info.write_transfer_count
-                    + info.other_transfer_count) as u64;
+                let read_bytes = info.read_transfer_count as u64;
+                let write_bytes = info.write_transfer_count as u64;
+                let io_bytes =
+                    read_bytes + write_bytes + info.other_transfer_count as u64;
+                let (rx, tx) = *self.pid_net_rates.get(&pid).unwrap_or(&(0, 0));
                 let mut stat = ProcStat {
                     pid,
                     name,
@@ -797,7 +818,11 @@ impl Sampler {
                     ws_bytes: info.working_set_size as u64,
                     ws_private: info.working_set_private_size.max(0) as u64,
                     io_bps: 0,
-                    net_bps: *self.pid_net_rates.get(&pid).unwrap_or(&0),
+                    io_read_bps: 0,
+                    io_write_bps: 0,
+                    net_bps: rx + tx,
+                    net_rx_bps: rx,
+                    net_tx_bps: tx,
                     gpu_pct: *self.pid_gpu.get(&pid).unwrap_or(&0.0),
                     audio: *self.pid_audio.get(&pid).unwrap_or(&0.0),
                 };
@@ -807,8 +832,10 @@ impl Sampler {
                     stat.cpu_pct =
                         ((cpu_d as f64 / (elapsed * 1e7)) / self.ncpus * 100.0).min(100.0) as f32;
                     stat.io_bps = crate::util::rate(prev.io_bytes, io_bytes, elapsed);
+                    stat.io_read_bps = crate::util::rate(prev.read_bytes, read_bytes, elapsed);
+                    stat.io_write_bps = crate::util::rate(prev.write_bytes, write_bytes, elapsed);
                 }
-                new_pids.insert(pid, PidTimes { cpu_100ns, io_bytes });
+                new_pids.insert(pid, PidTimes { cpu_100ns, io_bytes, read_bytes, write_bytes });
                 procs.push(stat);
             }
             if info.next_entry_offset == 0 {
