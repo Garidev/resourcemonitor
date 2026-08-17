@@ -4,6 +4,7 @@
 //! All UI state lives here on the UI thread.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -239,7 +240,16 @@ impl Default for RuleDraft {
 pub struct Ui {
     shared: Arc<Shared>,
     cfg: Settings,
-    snap: Snapshot,
+    /// The latest sample.
+    ///
+    /// Behind an `Rc` because the paint needs a snapshot it can read while it
+    /// also holds `&mut self` for hit registration, and the way it got one was
+    /// a deep clone — of a `Vec<ProcStat>` with a `String` per process, two or
+    /// three times per paint. That was tolerable at one paint per second and is
+    /// not at sixty, which is what the hover cross-fade made possible. Cloning
+    /// an `Rc` is a refcount bump, so the deep copy now happens once per
+    /// *sample* instead of several times per *frame*.
+    snap: Rc<Snapshot>,
     hist_cpu: Ring,
     hist_mem: Ring,
     hist_gpu: Ring,
@@ -375,7 +385,7 @@ pub struct Ui {
     mcp_messages: std::collections::VecDeque<(String, String, String)>,
     /// Freeze the drill-down list so fast-moving rows can be clicked.
     paused: bool,
-    frozen: Option<Snapshot>,
+    frozen: Option<Rc<Snapshot>>,
     /// True briefly after the MCP connect command is copied, so the button
     /// can read "Copied" as confirmation. Reset on any view change.
     mcp_copied: bool,
@@ -621,7 +631,7 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         shared: shared.clone(),
         tray: Tray::new(hwnd, &cfg),
         cfg,
-        snap: Snapshot::default(),
+        snap: Rc::new(Snapshot::default()),
         hist_cpu: Ring::new(60),
         hist_mem: Ring::new(60),
         hist_gpu: Ring::new(60),
@@ -1041,7 +1051,7 @@ impl Ui {
     // ------------------------------------------------------------ events
 
     fn on_snapshot(&mut self, hwnd: HWND) {
-        self.snap = self.shared.snap.lock().unwrap().clone();
+        self.snap = Rc::new(self.shared.snap.lock().unwrap().clone());
         if matches!(self.view, View::Connections) {
             self.refresh_conns();
         }
@@ -1356,6 +1366,18 @@ impl Ui {
         self.visible = false;
         self.shared.panel_open.store(false, Ordering::Relaxed);
         config::save(&self.cfg);
+        // Release the back buffer. At 336 px by the window's height this DIB is
+        // about a megabyte, and the panel spends most of its life hidden in the
+        // tray — holding a megabyte for a window nobody is looking at is the
+        // opposite of what this app is for. Caching it across paints is still
+        // right while it *is* open: rebuilding per paint meant allocating and
+        // freeing that much on every hover change.
+        self.bb = None;
+        self.fade = None;
+        if self.fade_timer {
+            unsafe { KillTimer(hwnd, ID_FADE) };
+            self.fade_timer = false;
+        }
         unsafe { ShowWindow(hwnd, SW_HIDE) };
     }
 
