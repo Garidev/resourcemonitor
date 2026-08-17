@@ -1,7 +1,7 @@
 # Resource Monitor
 
 **Website: [resourcemonitor.app](https://resourcemonitor.app)** — download the
-signed installer there.
+installer there.
 
 A lightweight Windows system-tray resource monitor written in Rust. Two
 binaries, no runtime dependencies: `resmon.exe` (~740 KB) and the MCP shim
