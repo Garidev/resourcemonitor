@@ -13,12 +13,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use super::gdi;
 
 /// (label, COLORREF) presets; indices stored in config.
+///
+/// Deliberately literal rather than the theme's accents. The overlay is drawn
+/// over whatever a game is rendering, not over one of the app's own surfaces,
+/// so a colour tuned for a white card is the wrong answer here — and an overlay
+/// that changed colour because the panel's theme changed would be surprising.
 pub const COLORS: [(&str, u32); 5] = [
     ("white", gdi::rgb(240, 242, 245)),
-    ("green", gdi::ACC_RAM),
-    ("red", gdi::ACC_FPS),
+    ("green", gdi::rgb(70, 190, 113)),
+    ("red", gdi::rgb(245, 116, 109)),
     ("cyan", gdi::rgb(80, 220, 255)),
-    ("yellow", gdi::ACC_NET),
+    ("yellow", gdi::rgb(241, 164, 39)),
 ];
 /// (label, alpha) presets.
 pub const OPACITIES: [(&str, u8); 3] = [("40%", 102), ("70%", 178), ("100%", 255)];

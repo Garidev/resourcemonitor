@@ -289,26 +289,26 @@ unsafe extern "system" fn widget_proc(
                 let last = segs.len().saturating_sub(1);
                 for (i, m) in segs.into_iter().enumerate() {
                     let (label, accent, value) = match m {
-                        M_CPU => ("CPU", gdi::ACC_CPU, format!("{:.0}%", d.cpu)),
-                        M_RAM => ("RAM", gdi::ACC_RAM, format!("{:.0}%", d.ram)),
+                        M_CPU => ("CPU", gdi::acc().cpu, format!("{:.0}%", d.cpu)),
+                        M_RAM => ("RAM", gdi::acc().ram, format!("{:.0}%", d.ram)),
                         M_GPU => (
                             "GPU",
-                            gdi::ACC_GPU,
+                            gdi::acc().gpu,
                             if d.gpu_ok { format!("{:.0}%", d.gpu) } else { "—".into() },
                         ),
                         M_FPS => (
                             "FPS",
-                            gdi::ACC_FPS,
+                            gdi::acc().fps,
                             d.fps.map(|f| f.to_string()).unwrap_or_else(|| "—".into()),
                         ),
                         M_DISK => (
                             "DSK",
-                            gdi::ACC_DISK,
+                            gdi::acc().disk,
                             format!("R{} W{}", compact_rate(d.dr), compact_rate(d.dw)),
                         ),
                         M_NET => (
                             "NET",
-                            gdi::ACC_NET,
+                            gdi::acc().net,
                             format!("↓{} ↑{}", compact_rate(d.rx), compact_rate(d.tx)),
                         ),
                         // Running agents and waiting messages are separate
@@ -316,7 +316,7 @@ unsafe extern "system" fn widget_proc(
                         // being added together into one meaningless number.
                         _ => (
                             "AI",
-                            gdi::ACC_GPU,
+                            gdi::acc().gpu,
                             match (d.agents, d.msgs) {
                                 (0, 0) => "—".into(),
                                 (a, 0) => format!("{a}◆"),

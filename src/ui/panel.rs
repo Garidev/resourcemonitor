@@ -27,7 +27,10 @@ use crate::config::{self, Settings};
 use crate::conns;
 use crate::rules;
 use crate::sampler::{ProcStat, Shared, Snapshot, WM_APP_NOTIFY, WM_APP_SNAPSHOT};
-use crate::util::{format_bytes, format_pct, format_rate, NavTrail, Ring};
+use crate::util::{
+    format_bytes, format_pct, format_rate, Ceiling, NavTrail, Ring, Scale, CARD_METRIC, RADIUS,
+    ROW_LIST, ROW_METRIC, ROW_NAV, ROW_NAV_STRIDE, SP1, SP2, SP3, SP4,
+};
 
 const IDM_EXIT: u32 = 100;
 const IDM_AUTOSTART: u32 = 101;
@@ -236,6 +239,23 @@ pub struct Ui {
     hist_gpu: Ring,
     hist_disk: Ring,
     hist_net: Ring,
+    /// The current paint's pixel surface, valid only between `BackBuffer::new`
+    /// and `present`. Charts reach for it to write antialiased coverage; when
+    /// it is `None` they fall back to an aliased `Polyline`, so a DIB that
+    /// failed to allocate degrades instead of disappearing.
+    surf: Option<gdi::Surface>,
+    /// True between button-down and button-up, so a card can paint its press
+    /// state. Press is new: the panel previously gave no feedback at all
+    /// between hover and whatever the click did.
+    pressed: bool,
+    /// Sticky y-ceilings for the four rate charts. One `f32` each; see
+    /// [`util::Ceiling`]. Only the rate metrics need them — percentages pin to
+    /// 100 and FPS quantises off a 60 floor.
+    ceil_disk: Ceiling,
+    ceil_net: Ceiling,
+    ceil_watch_ram: Ceiling,
+    ceil_watch_disk: Ceiling,
+    ceil_watch_net: Ceiling,
     hist_audio: Ring,
     hist_fps: Ring,
     view: View,
@@ -489,10 +509,10 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
     }
 
     let fonts = Fonts::new(scale);
-    let edit = make_edit(hwnd, EDIT_FILTER, fonts.normal);
-    let edit_val = make_edit(hwnd, EDIT_VALUE, fonts.normal);
-    let edit_path = make_edit(hwnd, EDIT_PATH, fonts.normal);
-    let edit_notify = make_edit(hwnd, EDIT_NOTIFY, fonts.normal);
+    let edit = make_edit(hwnd, EDIT_FILTER, fonts.body);
+    let edit_val = make_edit(hwnd, EDIT_VALUE, fonts.body);
+    let edit_path = make_edit(hwnd, EDIT_PATH, fonts.body);
+    let edit_notify = make_edit(hwnd, EDIT_NOTIFY, fonts.body);
     let edit_brush = unsafe { CreateSolidBrush(gdi::t().input_bg) };
 
     let start_pinned = cfg.pinned;
@@ -506,6 +526,13 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         hist_gpu: Ring::new(60),
         hist_disk: Ring::new(60),
         hist_net: Ring::new(60),
+        surf: None,
+        pressed: false,
+        ceil_disk: Ceiling::default(),
+        ceil_net: Ceiling::default(),
+        ceil_watch_ram: Ceiling::default(),
+        ceil_watch_disk: Ceiling::default(),
+        ceil_watch_net: Ceiling::default(),
         hist_audio: Ring::new(60),
         hist_fps: Ring::new(60),
         view: View::Main,
@@ -614,7 +641,7 @@ impl Ui {
     /// Gap the "add" chip needs at the right of the notify input. Painted
     /// frame and EDIT child both size from this, so they cannot disagree.
     fn add_chip_gap(&self, dc: HDC) -> i32 {
-        gdi::text_width(dc, self.fonts.small, "add") + self.s(16) + self.s(6)
+        gdi::text_width(dc, self.fonts.micro, "add") + self.s(16) + self.s(6)
     }
 
     fn handle(&mut self, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
@@ -662,6 +689,12 @@ impl Ui {
             WM_LBUTTONDOWN => {
                 let x = (lparam & 0xFFFF) as i16 as i32;
                 let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+                // Set before dispatching so the card the click lands on paints
+                // its press state. The action still fires on button-down, so
+                // nothing about the interaction model changes — the user simply
+                // sees the press land, which the panel never showed before.
+                self.pressed = true;
+                self.hover_pos = Some((x, y));
                 self.click(hwnd, x, y);
                 Some(0)
             }
@@ -691,11 +724,22 @@ impl Ui {
             }
             WM_LBUTTONUP if self.metric_drag.is_some() => {
                 let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+                self.pressed = false;
                 self.drop_metric(hwnd, y);
                 Some(0)
             }
+            WM_LBUTTONUP => {
+                // Repaint to drop the press state, then fall through: swallowing
+                // button-up here would break the default processing the window
+                // still relies on.
+                if std::mem::take(&mut self.pressed) {
+                    unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+                }
+                None
+            }
             WM_MOUSELEAVE => {
                 self.mouse_tracking = false;
+                self.pressed = false;
                 if self.hover_pos.take().is_some() {
                     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
                 }
@@ -871,6 +915,11 @@ impl Ui {
         self.hist_disk.push((s.disk_read_bps + s.disk_write_bps) as f32);
         self.hist_net.push((s.net_rx_bps + s.net_tx_bps) as f32);
         self.hist_audio.push(s.audio_peak * 100.0);
+        // Advance the sticky rate ceilings exactly once per sample. Doing this
+        // in the paint would decay them at the repaint rate, which hover alone
+        // can drive to dozens of times a second.
+        self.ceil_disk.update(self.hist_disk.max());
+        self.ceil_net.update(self.hist_net.max());
         // 0 when nothing is presenting, so the graph flatlines rather than
         // holding the last frame rate of an app that has since closed.
         self.hist_fps.push(s.fps.as_ref().map(|(_, _, f)| *f as f32).unwrap_or(0.0));
@@ -884,6 +933,9 @@ impl Ui {
                 self.watch_rings[3].push(a.disk_bps as f32);
                 self.watch_rings[4].push(a.net_bps as f32);
                 self.watch_rings[5].push(watch_fps(&self.snap, &name) as f32);
+                self.ceil_watch_ram.update(self.watch_rings[1].max());
+                self.ceil_watch_disk.update(self.watch_rings[3].max());
+                self.ceil_watch_net.update(self.watch_rings[4].max());
             }
         }
 
@@ -1081,7 +1133,7 @@ impl Ui {
         // Metric rows are hideable, so the band is sized from the count the
         // main view will draw — a constant here left dead space per hidden
         // row. Drives are two lines each: 22 for the figures, 20 for the bar.
-        let metrics = self.visible_metric_rows() as i32 * self.s(52);
+        let metrics = self.visible_metric_rows() as i32 * self.s(ROW_METRIC);
         self.s(12 + 26 + 30 + 50 + 26) + metrics + drives * self.s(42) + temps + mcp + self.s(12)
     }
 
@@ -1292,6 +1344,146 @@ impl Ui {
 
     fn hover_fill(&self, dc: HDC, r: &RECT, base: u32) {
         gdi::fill(dc, r, if self.hovered(r) { gdi::t().card_hover } else { base });
+    }
+
+    /// A card at rest, hovered or pressed. Hover also lifts the border one mix
+    /// step toward `text`, so the edge moves with the fill instead of staying
+    /// put and reading as a seam.
+    fn card(&self, dc: HDC, r: &RECT) {
+        let hot = self.hovered(r);
+        let down = hot && self.pressed;
+        let fill = if down {
+            gdi::t().card_press
+        } else if hot {
+            gdi::t().card_hover
+        } else {
+            gdi::t().card
+        };
+        let line =
+            if hot { gdi::mix(gdi::t().line, gdi::t().text, 0.14) } else { gdi::t().line };
+        gdi::card(dc, r, fill, line, self.s(RADIUS));
+    }
+
+    /// Metric glyph plus its name, both in the metric's accent, centred on the
+    /// card's midline — the same line the value sits on. Returns the right edge
+    /// of the ink, which is the budget `draw_figures` measures against.
+    fn metric_name(
+        &self,
+        dc: HDC,
+        card: &RECT,
+        accent: u32,
+        glyph: gdi::Glyph,
+        label: &str,
+    ) -> i32 {
+        let mid = (card.top + card.bottom) / 2;
+        let g = self.s(GLYPH);
+        let x = card.left + self.s(SP4);
+        gdi::metric_icon(dc, x + g / 2, mid, g, self.s(1).max(1), accent, glyph);
+        let caps = label.to_uppercase();
+        let track = self.s(gdi::TRACK_LABEL);
+        let tx = x + g + self.s(SP2);
+        gdi::text_t(
+            dc,
+            tx,
+            gdi::centre_y(dc, self.fonts.label, mid),
+            self.fonts.label,
+            track,
+            accent,
+            &caps,
+        );
+        tx + gdi::text_width_t(dc, self.fonts.label, track, &caps)
+    }
+
+    /// Width a unit occupies to the right of a figure, gap included.
+    fn unit_w(&self, dc: HDC, u: Unit) -> i32 {
+        match u {
+            Unit::None => 0,
+            Unit::Word(w) => {
+                self.s(SP2) + gdi::text_width_t(dc, self.fonts.micro, self.s(gdi::TRACK_MICRO), w)
+            }
+            Unit::Down | Unit::Up => self.s(SP2) + self.s(MARKER),
+        }
+    }
+
+    /// Draw a direction marker centred on `mid`, its left edge at `x`.
+    fn draw_marker(&self, dc: HDC, x: i32, mid: i32, size: i32, u: Unit) {
+        if u != Unit::Down && u != Unit::Up {
+            return;
+        }
+        let th = (size / 8).max(1);
+        gdi::arrow(dc, x + size / 2, mid, size, th, gdi::t().mute, u == Unit::Down);
+    }
+
+    /// A metric row's right-hand figures, per §2 of the UI foundation.
+    ///
+    /// Two rules, and the second is the one that matters: the primary value is
+    /// baseline-centred on the card's midline **in every row**, and the
+    /// secondary figure is taken out of the vertical flow and hung off the
+    /// card's bottom edge. Stacking the pair and centring it — the obvious
+    /// layout — puts the value ~5 px high in rows that have a secondary and
+    /// exactly on the midline in rows that don't, so the value column zigzags
+    /// down the panel and no value lines up with its own metric name.
+    ///
+    /// `name_right` is the right edge of the metric name's ink, and `right` the
+    /// right edge of the figure column. Between them is the band the value has
+    /// to fit in; when it will not, the value steps down its font ladder, and if
+    /// even the smallest step will not clear, the name ellipsises. A value and a
+    /// name must never be able to overlap.
+    fn draw_figures(&self, dc: HDC, card: &RECT, name_right: i32, right: i32, f: &Figures) {
+        let mid = (card.top + card.bottom) / 2;
+        let uw = self.unit_w(dc, f.unit);
+        let budget = right - uw - name_right - self.s(SP3);
+        let stack = self.fonts.fit_stack();
+        let mut font = *stack.last().expect("fit_stack is never empty");
+        for &cand in stack.iter() {
+            if gdi::text_width(dc, cand, &f.value) <= budget {
+                font = cand;
+                break;
+            }
+        }
+
+        let vx = right - uw;
+        let vy = gdi::centre_y(dc, font, mid);
+        gdi::text_right(dc, vx, vy, font, gdi::t().text, &f.value);
+
+        match f.unit {
+            Unit::None => {}
+            Unit::Word(w) => {
+                // Share the value's baseline rather than its box: the two steps
+                // differ by 4 px of cell, so box-aligning them sits the unit low.
+                let (vasc, _, _) = gdi::text_metrics(dc, font);
+                let (masc, _, _) = gdi::text_metrics(dc, self.fonts.micro);
+                gdi::text_t(
+                    dc,
+                    vx + self.s(SP2),
+                    vy + vasc - masc,
+                    self.fonts.micro,
+                    self.s(gdi::TRACK_MICRO),
+                    gdi::t().mute,
+                    w,
+                );
+            }
+            u => self.draw_marker(dc, vx + self.s(SP2), mid, self.s(MARKER), u),
+        }
+
+        let Some(sub) = &f.sub else { return };
+        let suw = self.unit_w(dc, f.sub_unit);
+        let sy = gdi::bottom_y(dc, self.fonts.micro, card.bottom, self.s(SP1));
+        gdi::text_right_t(
+            dc,
+            right - suw,
+            sy,
+            self.fonts.micro,
+            self.s(gdi::TRACK_MICRO),
+            gdi::t().mute,
+            sub,
+        );
+        if f.sub_unit != Unit::None {
+            let smid = gdi::centre_y(dc, self.fonts.micro, 0);
+            // centre_y(…, 0) is the offset from a midline to the cell top, so
+            // subtracting it from sy recovers the midline this run sits on.
+            self.draw_marker(dc, right - suw + self.s(SP2), sy - smid, self.s(MARKER_SM), f.sub_unit);
+        }
     }
 
     fn refresh_autostart(&mut self) {
@@ -1652,7 +1844,7 @@ impl Ui {
                 self.fonts.destroy();
                 self.fonts = Fonts::new(self.scale);
                 for e in [self.edit, self.edit_val, self.edit_path, self.edit_notify] {
-                    unsafe { SendMessageW(e, WM_SETFONT, self.fonts.normal as usize, 1) };
+                    unsafe { SendMessageW(e, WM_SETFONT, self.fonts.body as usize, 1) };
                 }
                 // Every layout constant is in scaled units, so the window
                 // itself has to resize or the new text has nowhere to go.
@@ -2124,6 +2316,7 @@ impl Ui {
             self.notify_text_y = -1;
             self.update_edit(&rc);
             let bb = BackBuffer::new(hdc, rc.right, rc.bottom);
+            self.surf = bb.surface();
             gdi::fill(bb.dc, &rc, gdi::t().bg);
             self.hits.clear();
             match self.view {
@@ -2138,6 +2331,9 @@ impl Ui {
                 View::Activity => self.draw_activity(bb.dc, &rc),
                 View::SettingsPage(p) => self.draw_settings_page(bb.dc, &rc, p),
             }
+            // Dropped before the buffer is, so no chart can hold a pointer
+            // into a DIB that has been deleted.
+            self.surf = None;
             bb.present();
             EndPaint(hwnd, &ps);
         }
@@ -2200,10 +2396,10 @@ impl Ui {
 
     /// Small text button; returns the next button's right edge.
     fn button(&mut self, dc: HDC, right_edge: i32, y: i32, label: &str, active: bool, action: Action) -> i32 {
-        let w = gdi::text_width(dc, self.fonts.small, label);
+        let w = gdi::text_width(dc, self.fonts.micro, label);
         let x = right_edge - w;
-        let color = if active { gdi::ACC_CPU } else { gdi::t().dim };
-        gdi::text(dc, x, y, self.fonts.small, color, label);
+        let color = if active { gdi::acc().cpu } else { gdi::t().dim };
+        gdi::text(dc, x, y, self.fonts.micro, color, label);
         let pad = self.s(6);
         let hit = RECT {
             left: x - pad,
@@ -2220,7 +2416,7 @@ impl Ui {
     /// Sits on the same baseline as the text buttons beside it despite using
     /// a larger font.
     fn close_button(&mut self, dc: HDC, right_edge: i32, y: i32) -> i32 {
-        let w = gdi::text_width(dc, self.fonts.normal, "×");
+        let w = gdi::text_width(dc, self.fonts.body, "×");
         let x = right_edge - w;
         let hit = RECT {
             left: x - self.s(7),
@@ -2232,29 +2428,31 @@ impl Ui {
         if hot {
             gdi::fill(dc, &hit, gdi::t().card_hover);
         }
-        let (sasc, _, _) = gdi::text_metrics(dc, self.fonts.small);
-        let (nasc, _, _) = gdi::text_metrics(dc, self.fonts.normal);
+        let (sasc, _, _) = gdi::text_metrics(dc, self.fonts.micro);
+        let (nasc, _, _) = gdi::text_metrics(dc, self.fonts.body);
         let baseline = y + sasc;
         let color = if hot { gdi::rgb(230, 100, 100) } else { gdi::t().dim };
-        gdi::text(dc, x, baseline - nasc, self.fonts.normal, color, "×");
+        gdi::text(dc, x, baseline - nasc, self.fonts.body, color, "×");
         self.hits.push((hit, Action::ClosePanel));
         x - self.s(14)
     }
 
     /// Filled pill button (for save/cancel and choice chips).
     fn chip(&mut self, dc: HDC, x: i32, y: i32, label: &str, active: bool, action: Action) -> i32 {
-        let w = gdi::text_width(dc, self.fonts.small, label) + self.s(16);
+        let w = gdi::text_width(dc, self.fonts.micro, label) + self.s(16);
         let r = RECT { left: x, top: y, right: x + w, bottom: y + self.ctrl_h() };
-        gdi::fill(dc, &r, if active { gdi::ACC_CPU } else { gdi::t().card });
+        let fill_c = if active { gdi::acc().cpu } else { gdi::t().card };
+        let line_c = if active { fill_c } else { gdi::t().line };
+        gdi::card(dc, &r, fill_c, line_c, self.s(RADIUS));
         // Centred rather than offset by a constant, so the label stays put if
         // the control height or the font ever changes.
-        let (asc, desc, _) = gdi::text_metrics(dc, self.fonts.small);
+        let (asc, desc, _) = gdi::text_metrics(dc, self.fonts.micro);
         gdi::text(
             dc,
-            x + self.s(8),
+            x + self.s(SP3),
             y + (self.ctrl_h() - (asc + desc)) / 2,
-            self.fonts.small,
-            if active { gdi::rgb(15, 17, 20) } else { gdi::t().text },
+            self.fonts.micro,
+            if active { gdi::on(fill_c) } else { gdi::t().text },
             label,
         );
         self.hits.push((r, action));
@@ -2307,7 +2505,7 @@ impl Ui {
         y += self.s(26);
 
         // --- find-app row: label + framed input (EDIT overlays the frame)
-        gdi::text(dc, pad, y + self.s(4), self.fonts.small, gdi::t().dim, "Find app");
+        gdi::text(dc, pad, y + self.s(4), self.fonts.micro, gdi::t().dim, "Find app");
         let frame = RECT {
             left: pad + self.s(60),
             top: pad + self.s(25),
@@ -2321,16 +2519,16 @@ impl Ui {
         // --- app finder results replace the overview while searching
         if !self.filter.is_empty() {
             if self.snap.procs.is_empty() {
-                gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "Collecting data…");
+                gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "Collecting data…");
                 return;
             }
             self.drawn_rows = top_by(&self.snap.procs, Metric::Cpu, 20, &self.filter);
             if self.drawn_rows.is_empty() {
-                gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "No apps match your search");
+                gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "No apps match your search");
                 return;
             }
             let rows = self.drawn_rows.clone();
-            let name_fonts = [self.fonts.normal, self.fonts.small];
+            let name_fonts = [self.fonts.body, self.fonts.micro];
             for (idx, (name, _)) in rows.iter().enumerate() {
                 let a = watch_sums(&self.snap.procs, name);
                 let vs = format!(
@@ -2339,15 +2537,15 @@ impl Ui {
                     format_bytes(a.ram_private),
                     format_rate(a.net_bps)
                 );
-                let vw = gdi::text_width(dc, self.fonts.small, &vs);
+                let vw = gdi::text_width(dc, self.fonts.micro, &vs);
                 let hit = RECT { left: pad, top: y - self.s(2), right: rc.right - pad, bottom: y + self.s(22) };
                 if self.hovered(&hit) {
                     gdi::fill(dc, &hit, gdi::t().card_hover);
                 }
                 gdi::text_fit(dc, pad + self.s(4), y, rc.right - pad - vw - self.s(14), &name_fonts, gdi::t().text, name);
-                gdi::text_right(dc, rc.right - pad - self.s(4), y + self.s(2), self.fonts.small, gdi::t().dim, &vs);
+                gdi::text_right(dc, rc.right - pad - self.s(4), y + self.s(2), self.fonts.micro, gdi::t().dim, &vs);
                 self.hits.push((hit, Action::Watch(idx)));
-                y += self.s(26);
+                y += self.s(ROW_LIST);
                 if y > rc.bottom - self.s(24) {
                     break;
                 }
@@ -2357,61 +2555,66 @@ impl Ui {
 
 
         // --- metric rows
-        let gpu_value = if s.gpu_ok { format_pct(s.gpu_pct) } else { "—".to_string() };
+        let gpu_figs = if s.gpu_ok {
+            Figures::new(format_pct(s.gpu_pct))
+        } else {
+            Figures::new("—".to_string())
+        };
         // FPS reads as a dash when nothing is presenting, exactly as GPU does
         // when the card reports no usage. It used to be a special-cased row
         // above these with a prose empty state and no graph.
-        let fps_value = match (&s.fps, s.etw_ok) {
-            (Some((_, name, fps)), _) => format!("{}  ·  {}", fps, name),
-            (None, true) => "—".to_string(),
-            (None, false) => "Run as administrator to see".to_string(),
+        let fps_figs = match (&s.fps, s.etw_ok) {
+            (Some((_, name, fps)), _) => Figures::new(fps.to_string())
+                .unit(Unit::Word("fps"))
+                .sub(format!("in {}", name), Unit::None),
+            (None, true) => Figures::new("—".to_string()),
+            (None, false) => Figures::new("—".to_string())
+                .sub("run as administrator to see".to_string(), Unit::None),
         };
-        // name, action, value, ring, graph ceiling — label and accent come
+        let ram_figs = {
+            let f = Figures::new(format_bytes(s.mem_used)).unit(Unit::Word("used"));
+            if s.mem_total > 0 {
+                let pct = s.mem_used as f32 / s.mem_total as f32 * 100.0;
+                f.sub(
+                    format!("of {} · {}", format_bytes(s.mem_total), format_pct(pct)),
+                    Unit::None,
+                )
+            } else {
+                f
+            }
+        };
+        // name, action, figures, ring, scale — label, accent and glyph all come
         // from `metric_label`, the one map for a main_metrics name.
-        let rows: [(&str, Action, String, &Ring, f32); 7] = [
+        let rows: [(&str, Action, Figures, &Ring, Scale); 7] = [
             (
                 "cpu",
                 Action::Drill(Metric::Cpu),
-                format_pct(s.cpu_pct),
+                Figures::new(format_pct(s.cpu_pct)),
                 &self.hist_cpu,
-                100.0,
+                Scale::Percent,
             ),
-            (
-                "ram",
-                Action::Drill(Metric::Ram),
-                format_bytes(s.mem_used),
-                &self.hist_mem,
-                100.0,
-            ),
-            (
-                "gpu",
-                Action::Drill(Metric::Gpu),
-                gpu_value,
-                &self.hist_gpu,
-                100.0,
-            ),
+            ("ram", Action::Drill(Metric::Ram), ram_figs, &self.hist_mem, Scale::Percent),
+            ("gpu", Action::Drill(Metric::Gpu), gpu_figs, &self.hist_gpu, Scale::Percent),
             // Visually uniform with the rest, but keeps its own destination:
             // the FPS list, not a generic drill.
-            (
-                "fps",
-                Action::ShowFpsApps,
-                fps_value,
-                &self.hist_fps,
-                self.hist_fps.max().max(60.0),
-            ),
+            ("fps", Action::ShowFpsApps, fps_figs, &self.hist_fps, Scale::Fps),
             (
                 "disk",
                 Action::Drill(Metric::Disk),
-                format!("R {}  ·  W {}", format_rate(s.disk_read_bps), format_rate(s.disk_write_bps)),
+                Figures::new(format_rate(s.disk_read_bps))
+                    .unit(Unit::Word("read"))
+                    .sub(format!("{} write", format_rate(s.disk_write_bps)), Unit::None),
                 &self.hist_disk,
-                self.hist_disk.max(),
+                Scale::Rate,
             ),
             (
                 "net",
                 Action::Drill(Metric::Net),
-                format!("↓ {}  ·  ↑ {}", net_rate(s.net_rx_bps), net_rate(s.net_tx_bps)),
+                Figures::new(net_rate(s.net_rx_bps))
+                    .unit(Unit::Down)
+                    .sub(net_rate(s.net_tx_bps), Unit::Up),
                 &self.hist_net,
-                self.hist_net.max(),
+                Scale::Rate,
             ),
             (
                 "audio",
@@ -2424,16 +2627,15 @@ impl Ui {
                         }
                     }
                     if names.is_empty() {
-                        "Silent".to_string()
+                        Figures::new("Silent".to_string())
                     } else {
-                        format!("{} playing", names.len())
+                        Figures::new(format!("{} playing", names.len()))
                     }
                 },
                 &self.hist_audio,
-                100.0,
+                Scale::Percent,
             ),
         ];
-        let fit = self.fonts.fit_stack();
         // Drawn in the user's chosen order, skipping the ones they hid. Any
         // row whose name is not in their list simply does not draw; config
         // guarantees every known metric is present, so that cannot silently
@@ -2443,33 +2645,51 @@ impl Ui {
             if !visible {
                 continue;
             }
-            let Some((_, action, value, ring, max)) =
-                rows.iter().find(|r| r.0 == name.as_str())
+            let Some((_, action, figs, ring, scale)) = rows.iter().find(|r| r.0 == name.as_str())
             else {
                 continue;
             };
-            let (label, accent) = metric_label(name);
-            let (action, value, ring, max) = (*action, value.clone(), *ring, *max);
-            let row = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + self.s(46) };
-            self.hover_fill(dc, &row, gdi::t().card);
-            gdi::text(dc, row.left + self.s(10), y + self.s(6), self.fonts.small, accent, label);
-            let spark = RECT {
-                left: row.right - self.s(118),
-                top: y + self.s(7),
-                right: row.right - self.s(8),
-                bottom: y + self.s(39),
+            let (label, accent, glyph) = metric_label(name);
+            let (action, ring, scale) = (*action, *ring, *scale);
+            let sticky = match name.as_str() {
+                "disk" => &self.ceil_disk,
+                _ => &self.ceil_net,
             };
-            gdi::text_fit(dc, row.left + self.s(10), y + self.s(21), spark.left - self.s(6), &fit, gdi::t().text, &value);
-            gdi::sparkline(dc, &spark, ring, max, accent);
+            let max = scale.ceiling(ring.max(), sticky);
+            let row = RECT {
+                left: pad,
+                top: y,
+                right: rc.right - pad,
+                bottom: y + self.s(CARD_METRIC),
+            };
+            self.card(dc, &row);
+            let name_right = self.metric_name(dc, &row, accent, glyph, label);
+            let spark = RECT {
+                left: row.right - self.s(120),
+                top: y + self.s(SP3),
+                right: row.right - self.s(SP4),
+                bottom: y + self.s(40),
+            };
+            self.draw_figures(dc, &row, name_right, spark.left - self.s(SP3), figs);
+            gdi::chart(
+                dc,
+                self.surf.as_ref(),
+                &spark,
+                ring,
+                max,
+                accent,
+                gdi::ChartSize::Row,
+                self.scale,
+            );
             self.hits.push((row, action));
-            y += self.s(52);
+            y += self.s(ROW_METRIC);
         }
 
         // --- drives
-        gdi::text(dc, pad, y + self.s(4), self.fonts.small, gdi::t().dim, "DRIVES");
+        gdi::text(dc, pad, y + self.s(4), self.fonts.micro, gdi::t().dim, "DRIVES");
         y += self.s(26);
         if s.drives.is_empty() {
-            gdi::text(dc, pad, y + self.s(4), self.fonts.normal, gdi::t().dim, "No drives found");
+            gdi::text(dc, pad, y + self.s(4), self.fonts.body, gdi::t().dim, "No drives found");
             y += self.s(30);
         }
         // Two lines per drive: letter and figures on top, full-width bar
@@ -2478,12 +2698,12 @@ impl Ui {
         for d in &s.drives {
             let used = d.total.saturating_sub(d.free);
             let frac = if d.total > 0 { used as f32 / d.total as f32 } else { 0.0 };
-            let (basc, _, _) = gdi::text_metrics(dc, self.fonts.bold);
-            let (sasc, _, _) = gdi::text_metrics(dc, self.fonts.small);
+            let (basc, _, _) = gdi::text_metrics(dc, self.fonts.value);
+            let (sasc, _, _) = gdi::text_metrics(dc, self.fonts.micro);
             let baseline = y + basc;
-            gdi::text(dc, pad, baseline - basc, self.fonts.bold, gdi::t().text, &format!("{}:", d.letter));
+            gdi::text(dc, pad, baseline - basc, self.fonts.value, gdi::t().text, &format!("{}:", d.letter));
             let label = format!("{} free of {}", format_bytes(d.free), format_bytes(d.total));
-            let lw = gdi::text_width(dc, self.fonts.small, &label);
+            let lw = gdi::text_width(dc, self.fonts.micro, &label);
             // Right-aligned, but never allowed to reach back into the letter.
             let lx = (rc.right - pad - lw).max(pad + self.s(30));
             gdi::text_fit(
@@ -2491,13 +2711,22 @@ impl Ui {
                 lx,
                 baseline - sasc,
                 rc.right - pad,
-                &[self.fonts.small],
+                &[self.fonts.micro],
                 gdi::t().dim,
                 &label,
             );
             y += self.s(22);
-            let bar = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + self.s(8) };
-            gdi::bar(dc, &bar, frac, gdi::ACC_DISK);
+            let bar = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + self.s(SP3) };
+            // Severity is separate from the metric's accent: a nearly full disk
+            // is a state the user should read at a glance, not a shade of teal.
+            let fill_c = if frac >= 0.95 {
+                gdi::t().danger
+            } else if frac >= 0.85 {
+                gdi::t().warn
+            } else {
+                gdi::acc().disk
+            };
+            gdi::bar(dc, &bar, frac, fill_c);
             y += self.s(20);
         }
 
@@ -2553,7 +2782,7 @@ impl Ui {
             rows.push((
                 format!("◇  {} new message{}", n, if n == 1 { "" } else { "s" }),
                 Action::ShowMcp,
-                gdi::ACC_NET,
+                gdi::acc().net,
             ));
         }
         if present > 0 || finished > 0 {
@@ -2571,7 +2800,7 @@ impl Ui {
             } else {
                 format!("◆  {} agent{} running", live, if live == 1 { "" } else { "s" })
             };
-            rows.push((label, Action::ShowActivity, gdi::ACC_GPU));
+            rows.push((label, Action::ShowActivity, gdi::acc().gpu));
         }
 
         let h = self.s(26);
@@ -2609,13 +2838,13 @@ impl Ui {
             let inner = RECT { left: bar.left + 1, top: bar.top + 1, right: bar.right - 1, bottom: bar.bottom - 1 };
             gdi::fill(dc, &inner, gdi::shade(accent, 0.12));
         }
-        let color = if hot { gdi::rgb(15, 17, 20) } else { accent };
+        let color = if hot { gdi::on(accent) } else { accent };
         gdi::text_fit(
             dc,
             bar.left + self.s(11),
             bar.top + self.s(6),
             bar.right - self.s(8),
-            &[self.fonts.bold_sm, self.fonts.small],
+            &[self.fonts.value_sm, self.fonts.micro],
             color,
             label,
         );
@@ -2631,12 +2860,12 @@ impl Ui {
             dc,
             x,
             y,
-            self.fonts.small,
+            self.fonts.micro,
             gdi::t().dim,
             "Connect it in Claude Code (run this once):",
         );
         let label = if self.mcp_copied { "Copied" } else { "Copy" };
-        let cw = gdi::text_width(dc, self.fonts.small, label) + self.s(16);
+        let cw = gdi::text_width(dc, self.fonts.micro, label) + self.s(16);
         self.chip(dc, right - cw, y - self.s(3), label, self.mcp_copied, Action::CopyMcpCmd);
         y += self.s(20);
         let box_r = RECT { left: x, top: y, right, bottom: y + self.s(22) };
@@ -2646,7 +2875,7 @@ impl Ui {
             x + self.s(8),
             y + self.s(4),
             right - self.s(8),
-            &[self.fonts.small],
+            &[self.fonts.micro],
             gdi::t().text,
             &mcp_connect_cmd(),
         );
@@ -2660,7 +2889,7 @@ impl Ui {
     fn draw_activity(&mut self, dc: HDC, rc: &RECT) {
         let pad = self.s(12);
         let mut y = pad;
-        y = self.header(dc, rc, y, "AI activity", gdi::ACC_GPU);
+        y = self.header(dc, rc, y, "AI activity", gdi::acc().gpu);
 
         let now = crate::sampler::unix_ms();
         let sessions: Vec<crate::sampler::AgentSession> =
@@ -2670,9 +2899,9 @@ impl Ui {
         let live_total: usize = sessions.iter().map(|s| s.agents.len()).sum();
 
         if live_total == 0 && history.is_empty() {
-            gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "Nothing reported");
-            gdi::text(dc, pad, y + self.s(20), self.fonts.small, gdi::t().dim, "When an AI tool tells this app what its");
-            gdi::text(dc, pad, y + self.s(35), self.fonts.small, gdi::t().dim, "agents are doing, it appears here.");
+            gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "Nothing reported");
+            gdi::text(dc, pad, y + self.s(20), self.fonts.micro, gdi::t().dim, "When an AI tool tells this app what its");
+            gdi::text(dc, pad, y + self.s(35), self.fonts.micro, gdi::t().dim, "agents are doing, it appears here.");
             return;
         }
 
@@ -2740,8 +2969,8 @@ impl Ui {
                         pad,
                         ry + self.s(5),
                         rc.right - pad,
-                        &[self.fonts.small],
-                        gdi::ACC_GPU,
+                        &[self.fonts.micro],
+                        gdi::acc().gpu,
                         label,
                     );
                 }
@@ -2752,7 +2981,7 @@ impl Ui {
                 Item::FinishedHeader(n) => {
                     let caret = if self.finished_expanded { "▾" } else { "▸" };
                     let label = format!("{}  Finished ({})", caret, n);
-                    gdi::text(dc, pad, ry + self.s(8), self.fonts.bold_sm, gdi::t().text, &label);
+                    gdi::text(dc, pad, ry + self.s(8), self.fonts.value_sm, gdi::t().text, &label);
                     let hit = RECT { left: pad, top: ry, right: rc.right - pad - self.s(60), bottom: ry + self.s(28) };
                     self.hits.push((hit, Action::ToggleFinished));
                     // History gets its own clear, so the header chip cannot
@@ -2780,7 +3009,7 @@ impl Ui {
         }
         let pad = self.s(12);
         let body_x = pad + self.s(16);
-        gdi::wrap_lines(dc, self.fonts.small, rc.right - pad - body_x, detail)
+        gdi::wrap_lines(dc, self.fonts.micro, rc.right - pad - body_x, detail)
             .len()
             .max(1) as i32
     }
@@ -2822,7 +3051,7 @@ impl Ui {
         let body_x = pad + self.s(16);
         let open = lines > 1 && self.agent_expanded.contains(&key);
         if lines > 1 {
-            gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, if open { "▾" } else { "▸" });
+            gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, if open { "▾" } else { "▸" });
         }
         if open {
             gdi::text_wrap(
@@ -2831,13 +3060,13 @@ impl Ui {
                 y,
                 rc.right - pad - body_x,
                 line_h,
-                self.fonts.small,
+                self.fonts.micro,
                 gdi::t().dim,
                 detail,
             );
             y + lines * line_h
         } else {
-            gdi::text_fit(dc, body_x, y, rc.right - pad, &[self.fonts.small], gdi::t().dim, detail);
+            gdi::text_fit(dc, body_x, y, rc.right - pad, &[self.fonts.micro], gdi::t().dim, detail);
             y + line_h
         }
     }
@@ -2854,8 +3083,8 @@ impl Ui {
             match a.status.as_str() {
                 "failed" => gdi::rgb(220, 90, 90),
                 "done" => gdi::t().dim,
-                "waiting" => gdi::ACC_FPS,
-                _ => gdi::ACC_GPU,
+                "waiting" => gdi::acc().fps,
+                _ => gdi::acc().gpu,
             }
         };
         self.agent_dot(dc, ry, dot_color, running && !stale);
@@ -2866,15 +3095,15 @@ impl Ui {
         } else {
             a.status.clone()
         };
-        let sw = gdi::text_width(dc, self.fonts.small, &status_text);
+        let sw = gdi::text_width(dc, self.fonts.micro, &status_text);
         let sx = rc.right - pad - sw;
-        gdi::text(dc, sx, ry, self.fonts.small, if stale { gdi::t().dim } else { dot_color }, &status_text);
+        gdi::text(dc, sx, ry, self.fonts.micro, if stale { gdi::t().dim } else { dot_color }, &status_text);
         gdi::text_fit(
             dc,
             pad + self.s(16),
             ry,
             sx - self.s(8),
-            &[self.fonts.bold_sm, self.fonts.small],
+            &[self.fonts.value_sm, self.fonts.micro],
             if stale { gdi::t().dim } else { gdi::t().text },
             // Fall back to the id when an assistant sends detail but no title,
             // so the row still identifies itself.
@@ -2894,15 +3123,15 @@ impl Ui {
             clock_of(f.finished_ms),
             crate::agents::format_duration(f.finished_ms.saturating_sub(f.started_ms))
         );
-        let sw = gdi::text_width(dc, self.fonts.small, &when);
+        let sw = gdi::text_width(dc, self.fonts.micro, &when);
         let sx = rc.right - pad - sw;
-        gdi::text(dc, sx, ry, self.fonts.small, gdi::t().dim, &when);
+        gdi::text(dc, sx, ry, self.fonts.micro, gdi::t().dim, &when);
         gdi::text_fit(
             dc,
             pad + self.s(16),
             ry,
             sx - self.s(8),
-            &[self.fonts.bold_sm, self.fonts.small],
+            &[self.fonts.value_sm, self.fonts.micro],
             color,
             if !f.title.is_empty() { &f.title } else { &f.id },
         );
@@ -2914,8 +3143,8 @@ impl Ui {
             pad + self.s(16),
             if f.detail.is_empty() { ry + self.s(31) } else { label_y },
             rc.right - pad,
-            &[self.fonts.small],
-            gdi::ACC_GPU,
+            &[self.fonts.micro],
+            gdi::acc().gpu,
             &f.session_label,
         );
     }
@@ -2945,11 +3174,11 @@ impl Ui {
     fn draw_mcp_messages(&mut self, dc: HDC, rc: &RECT) {
         let pad = self.s(12);
         let mut y = pad;
-        y = self.header(dc, rc, y, "Messages", gdi::ACC_GPU);
+        y = self.header(dc, rc, y, "Messages", gdi::acc().gpu);
 
         if self.mcp_messages.is_empty() {
-            gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "No messages yet");
-            gdi::text(dc, pad, y + self.s(20), self.fonts.small, gdi::t().dim, "Messages from connected AI tools appear here.");
+            gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "No messages yet");
+            gdi::text(dc, pad, y + self.s(20), self.fonts.micro, gdi::t().dim, "Messages from connected AI tools appear here.");
             return;
         }
 
@@ -2975,7 +3204,7 @@ impl Ui {
             // A message that fits on one line has nothing to expand, so it
             // gets no chevron and no click target — an affordance that does
             // nothing is worse than none.
-            let lines = gdi::wrap_lines(dc, self.fonts.small, body_w, message).len() as i32;
+            let lines = gdi::wrap_lines(dc, self.fonts.micro, body_w, message).len() as i32;
             let expandable = lines > 1;
             let open = expandable && self.msg_expanded.contains(&i);
             let body_h = if open { lines * line_h } else { line_h };
@@ -2997,13 +3226,13 @@ impl Ui {
                         open,
                     );
                 }
-                gdi::text(dc, body_x, ry, self.fonts.small, gdi::ACC_GPU, time);
+                gdi::text(dc, body_x, ry, self.fonts.micro, gdi::acc().gpu, time);
                 let head = if title.is_empty() { "message" } else { title.as_str() };
                 gdi::text(
                     dc,
                     body_x + self.s(40),
                     ry,
-                    self.fonts.bold_sm,
+                    self.fonts.value_sm,
                     gdi::t().text,
                     head,
                 );
@@ -3014,7 +3243,7 @@ impl Ui {
                         ry + self.s(20),
                         body_w,
                         line_h,
-                        self.fonts.small,
+                        self.fonts.micro,
                         gdi::t().dim,
                         message,
                     );
@@ -3024,7 +3253,7 @@ impl Ui {
                         body_x,
                         ry + self.s(20),
                         rc.right - pad,
-                        &[self.fonts.small],
+                        &[self.fonts.micro],
                         gdi::t().dim,
                         message,
                     );
@@ -3087,7 +3316,7 @@ impl Ui {
 
         // Centre the title's ascent-to-baseline block in the bar, then hang
         // everything else off that baseline.
-        let (asc, desc, ilead) = gdi::text_metrics(dc, self.fonts.bold);
+        let (asc, desc, ilead) = gdi::text_metrics(dc, self.fonts.value);
         let baseline = y + (h + asc - desc) / 2;
         let title_y = baseline - asc;
         // Middle of the capitals, which is what the eye reads as "centre".
@@ -3101,11 +3330,11 @@ impl Ui {
         // Right-hand action first: its hit must beat the bar's Back hit.
         let mut title_right = rc.right - pad - self.s(10);
         if let Some((label, color, action)) = right {
-            let lw = gdi::text_width(dc, self.fonts.small, label);
+            let lw = gdi::text_width(dc, self.fonts.micro, label);
             let lx = rc.right - pad - self.s(12) - lw;
             // Same baseline as the title, so the two runs sit level.
-            let (lasc, _, _) = gdi::text_metrics(dc, self.fonts.small);
-            gdi::text(dc, lx, baseline - lasc, self.fonts.small, color, label);
+            let (lasc, _, _) = gdi::text_metrics(dc, self.fonts.micro);
+            gdi::text(dc, lx, baseline - lasc, self.fonts.micro, color, label);
             self.hits.push((
                 RECT { left: lx - self.s(8), top: y, right: rc.right - pad, bottom: y + h },
                 action,
@@ -3118,7 +3347,7 @@ impl Ui {
             title_x,
             title_y,
             title_right,
-            &[self.fonts.bold, self.fonts.bold_sm],
+            &[self.fonts.value, self.fonts.value_sm],
             gdi::t().text,
             title,
         );
@@ -3132,10 +3361,10 @@ impl Ui {
 
     /// Height of a nav row, and the stride to the next thing below it.
     fn nav_row_h(&self) -> i32 {
-        self.s(30)
+        self.s(ROW_NAV)
     }
     fn nav_row_stride(&self) -> i32 {
-        self.s(36)
+        self.s(ROW_NAV_STRIDE)
     }
 
     /// A slim row that goes somewhere rather than reporting a number. Used
@@ -3147,14 +3376,14 @@ impl Ui {
         let pad = self.s(12);
         let row = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + self.nav_row_h() };
         self.hover_fill(dc, &row, gdi::t().card);
-        gdi::text(dc, row.left + self.s(10), y + self.s(7), self.fonts.small, gdi::ACC_NET, label);
+        gdi::text(dc, row.left + self.s(10), y + self.s(7), self.fonts.micro, gdi::acc().net, label);
         let chev = "›";
-        let cw = gdi::text_width(dc, self.fonts.small, chev);
+        let cw = gdi::text_width(dc, self.fonts.micro, chev);
         gdi::text(
             dc,
             row.right - self.s(10) - cw,
             y + self.s(7),
-            self.fonts.small,
+            self.fonts.micro,
             gdi::t().dim,
             chev,
         );
@@ -3179,12 +3408,12 @@ impl Ui {
         let pad = self.s(12);
         let mut y = pad;
         let (title, accent) = match metric {
-            Metric::Cpu => ("Top apps by CPU use", gdi::ACC_CPU),
-            Metric::Ram => ("Top apps by RAM use", gdi::ACC_RAM),
-            Metric::Gpu => ("Top apps by GPU use", gdi::ACC_GPU),
-            Metric::Disk => ("Top apps by disk activity", gdi::ACC_DISK),
-            Metric::Net => ("Top apps by network use", gdi::ACC_NET),
-            Metric::Audio => ("Apps playing sound", gdi::ACC_AUDIO),
+            Metric::Cpu => ("Top apps by CPU use", gdi::acc().cpu),
+            Metric::Ram => ("Top apps by RAM use", gdi::acc().ram),
+            Metric::Gpu => ("Top apps by GPU use", gdi::acc().gpu),
+            Metric::Disk => ("Top apps by disk activity", gdi::acc().disk),
+            Metric::Net => ("Top apps by network use", gdi::acc().net),
+            Metric::Audio => ("Apps playing sound", gdi::acc().audio),
         };
         y = self.header(dc, rc, y, title, accent);
         // The network list answers "how much"; the connections list answers
@@ -3204,7 +3433,7 @@ impl Ui {
 
         // Filter row: label + framed input + pause toggle. The EDIT control is
         // positioned in update_edit at (pad+44, filter_input_y()).
-        gdi::text(dc, pad, y + self.s(5), self.fonts.small, gdi::t().dim, "Filter");
+        gdi::text(dc, pad, y + self.s(5), self.fonts.micro, gdi::t().dim, "Filter");
         let top = self.filter_input_y() - self.s(3);
         let btn = self.s(26);
         let frame = RECT {
@@ -3218,7 +3447,7 @@ impl Ui {
         // Pause / resume toggle at the far right of the filter row. Its hit is
         // inserted at the front so no other rect can swallow the click.
         let label = if self.paused { "resume" } else { "pause" };
-        let lw = gdi::text_width(dc, self.fonts.small, label);
+        let lw = gdi::text_width(dc, self.fonts.micro, label);
         let pbtn = RECT {
             left: rc.right - pad - lw - self.s(14),
             top,
@@ -3226,20 +3455,20 @@ impl Ui {
             bottom: top + self.s(24),
         };
         let hot = self.hovered(&pbtn);
-        gdi::fill(dc, &pbtn, if self.paused || hot { gdi::ACC_FPS } else { gdi::t().card });
-        let gcol = if self.paused || hot { gdi::rgb(15, 17, 20) } else { gdi::t().text };
-        gdi::text(dc, pbtn.left + self.s(7), top + self.s(4), self.fonts.small, gcol, label);
+        gdi::fill(dc, &pbtn, if self.paused || hot { gdi::acc().fps } else { gdi::t().card });
+        let gcol = if self.paused || hot { gdi::on(gdi::acc().fps) } else { gdi::t().text };
+        gdi::text(dc, pbtn.left + self.s(7), top + self.s(4), self.fonts.micro, gcol, label);
         self.hits.insert(0, (pbtn, Action::TogglePause));
         y += self.s(32);
         if self.paused {
-            gdi::text(dc, pad, y - self.s(2), self.fonts.small, gdi::ACC_FPS, "Paused");
+            gdi::text(dc, pad, y - self.s(2), self.fonts.micro, gdi::acc().fps, "Paused");
             y += self.s(16);
         }
 
         // Per-core grid at the top of the CPU drill-down.
         if metric == Metric::Cpu && !snap.core_pcts.is_empty() {
             let cores = snap.core_pcts.clone();
-            gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, &format!("CPU CORES ({})", cores.len()));
+            gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, &format!("CPU CORES ({})", cores.len()));
             y += self.s(16);
             let cols: i32 = if cores.len() <= 8 { 2 } else if cores.len() <= 32 { 4 } else { 8 };
             let gap = self.s(6);
@@ -3250,40 +3479,40 @@ impl Ui {
                 let bx = pad + col * (bar_w + gap);
                 let by = y + row_i * self.s(12);
                 let r = RECT { left: bx, top: by, right: bx + bar_w, bottom: by + self.s(8) };
-                gdi::bar(dc, &r, pct / 100.0, gdi::ACC_CPU);
+                gdi::bar(dc, &r, pct / 100.0, gdi::acc().cpu);
             }
             let rows_n = (cores.len() as i32 + cols - 1) / cols;
             y += rows_n * self.s(12) + self.s(10);
         }
 
         if metric == Metric::Net && !snap.etw_ok {
-            gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "Network usage per app needs administrator access.");
-            gdi::text(dc, pad, y + self.s(20), self.fonts.small, gdi::t().dim, "Restart Resource Monitor as administrator, or turn on");
-            gdi::text(dc, pad, y + self.s(34), self.fonts.small, gdi::t().dim, "\"Start with Windows\" in settings, which runs it elevated.");
+            gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "Network usage per app needs administrator access.");
+            gdi::text(dc, pad, y + self.s(20), self.fonts.micro, gdi::t().dim, "Restart Resource Monitor as administrator, or turn on");
+            gdi::text(dc, pad, y + self.s(34), self.fonts.micro, gdi::t().dim, "\"Start with Windows\" in settings, which runs it elevated.");
             return;
         }
         if metric == Metric::Gpu && !snap.gpu_ok {
-            gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "Your GPU does not report usage data.");
+            gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "Your GPU does not report usage data.");
             return;
         }
         if snap.procs.is_empty() {
-            gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "Collecting data…");
+            gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "Collecting data…");
             return;
         }
 
         self.drawn_rows = top_by(&snap.procs, metric, 50, &self.filter);
         if self.drawn_rows.is_empty() {
-            gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "No apps are using this right now");
+            gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "No apps are using this right now");
             if metric == Metric::Net && !snap.net_ok {
-                gdi::text(dc, pad, y + self.s(20), self.fonts.small, gdi::t().dim, "You may need to run as administrator to see");
-                gdi::text(dc, pad, y + self.s(34), self.fonts.small, gdi::t().dim, "which apps are using the network.");
+                gdi::text(dc, pad, y + self.s(20), self.fonts.micro, gdi::t().dim, "You may need to run as administrator to see");
+                gdi::text(dc, pad, y + self.s(34), self.fonts.micro, gdi::t().dim, "which apps are using the network.");
             }
             return;
         }
         let rows = self.drawn_rows.clone();
-        let row_h = self.s(26);
+        let row_h = self.s(ROW_LIST);
         let list_top = y;
-        let name_fonts = [self.fonts.normal, self.fonts.small];
+        let name_fonts = [self.fonts.body, self.fonts.micro];
         // Clip the scrolling list to its own region so partially scrolled
         // rows never draw over the filter/header above it.
         let saved = unsafe { SaveDC(dc) };
@@ -3306,11 +3535,11 @@ impl Ui {
             if self.hovered(&row_bg) {
                 gdi::fill(dc, &row_bg, gdi::t().card_hover);
             }
-            let vw = gdi::text_width(dc, self.fonts.bold_sm, &vs);
+            let vw = gdi::text_width(dc, self.fonts.value_sm, &vs);
             let vx = kx - self.s(10) - vw;
             gdi::text_fit(dc, pad + self.s(4), ry, vx - self.s(8), &name_fonts, gdi::t().text, name);
-            gdi::text(dc, vx, ry, self.fonts.bold_sm, gdi::t().text, &vs);
-            gdi::text(dc, kx, ry, self.fonts.normal, gdi::rgb(220, 90, 90), "×");
+            gdi::text(dc, vx, ry, self.fonts.value_sm, gdi::t().text, &vs);
+            gdi::text(dc, kx, ry, self.fonts.body, gdi::rgb(220, 90, 90), "×");
             let name_hit = RECT {
                 left: pad,
                 top: (ry - self.s(2)).max(list_top),
@@ -3396,11 +3625,11 @@ impl Ui {
             Some(app) => format!("{} connections", app),
             None => "Live connections".to_string(),
         };
-        y = self.header(dc, rc, y, &title, gdi::ACC_NET);
+        y = self.header(dc, rc, y, &title, gdi::acc().net);
 
         // Filter row, same geometry as a drill-down's but with no pause
         // toggle: the list is already only as fast as the sweep.
-        gdi::text(dc, pad, y + self.s(5), self.fonts.small, gdi::t().dim, "Filter");
+        gdi::text(dc, pad, y + self.s(5), self.fonts.micro, gdi::t().dim, "Filter");
         let top = self.filter_input_y() - self.s(3);
         let frame = RECT {
             left: pad + self.s(44),
@@ -3413,7 +3642,7 @@ impl Ui {
         y += self.s(32);
 
         if self.conns_swept == 0 {
-            gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "Collecting connections…");
+            gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "Collecting connections…");
             return;
         }
 
@@ -3430,7 +3659,7 @@ impl Ui {
         } else {
             format!("{} shown · {} named · loopback hidden", rows.len(), named)
         };
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, &summary);
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, &summary);
         y += self.s(18);
         // Without the DNS provider only reverse lookups can name anything, so
         // say why the column is thin rather than letting it read as "nothing
@@ -3440,7 +3669,7 @@ impl Ui {
                 dc,
                 pad,
                 y,
-                self.fonts.small,
+                self.fonts.micro,
                 gdi::t().dim,
                 "Host names need administrator access.",
             );
@@ -3454,7 +3683,7 @@ impl Ui {
 
         let row_h = self.s(38);
         let list_top = y;
-        let name_fonts = [self.fonts.normal, self.fonts.small];
+        let name_fonts = [self.fonts.body, self.fonts.micro];
         let saved = unsafe { SaveDC(dc) };
         unsafe { IntersectClipRect(dc, 0, list_top, rc.right, rc.bottom) };
         for (idx, r) in rows.iter().enumerate() {
@@ -3479,9 +3708,9 @@ impl Ui {
                 Some(s) => format!("{}  {}", port, s),
                 None => port.to_string(),
             };
-            let rw = gdi::text_width(dc, self.fonts.bold_sm, &right);
+            let rw = gdi::text_width(dc, self.fonts.value_sm, &right);
             let rx = rc.right - pad - self.s(6) - rw;
-            gdi::text(dc, rx, ry, self.fonts.bold_sm, gdi::t().text, &right);
+            gdi::text(dc, rx, ry, self.fonts.value_sm, gdi::t().text, &right);
             gdi::text_fit(
                 dc,
                 pad + self.s(4),
@@ -3503,8 +3732,8 @@ impl Ui {
             let sy = ry + self.s(17);
             let mut right_edge = rc.right - pad - self.s(6);
             if !right_text.is_empty() {
-                let w = gdi::text_width(dc, self.fonts.small, &right_text);
-                gdi::text(dc, right_edge - w, sy, self.fonts.small, gdi::t().dim, &right_text);
+                let w = gdi::text_width(dc, self.fonts.micro, &right_text);
+                gdi::text(dc, right_edge - w, sy, self.fonts.micro, gdi::t().dim, &right_text);
                 right_edge -= w + self.s(10);
             }
             // A state worth mentioning is one that is not simply "connected".
@@ -3517,8 +3746,8 @@ impl Ui {
                 state.to_string()
             };
             if !label.is_empty() {
-                let w = gdi::text_width(dc, self.fonts.small, &label);
-                gdi::text(dc, right_edge - w, sy, self.fonts.small, gdi::t().dim, &label);
+                let w = gdi::text_width(dc, self.fonts.micro, &label);
+                gdi::text(dc, right_edge - w, sy, self.fonts.micro, gdi::t().dim, &label);
                 right_edge -= w + self.s(10);
             }
             gdi::text_fit(
@@ -3526,7 +3755,7 @@ impl Ui {
                 pad + self.s(4),
                 sy,
                 right_edge,
-                &[self.fonts.small],
+                &[self.fonts.micro],
                 gdi::t().dim,
                 &left_text,
             );
@@ -3545,7 +3774,7 @@ impl Ui {
         self.conn_rows = all;
 
         if self.conn_total > 0 && self.drawn_rows.is_empty() {
-            gdi::text(dc, pad, list_top, self.fonts.normal, gdi::t().dim, "Nothing matches that filter");
+            gdi::text(dc, pad, list_top, self.fonts.body, gdi::t().dim, "Nothing matches that filter");
         }
     }
 
@@ -3559,7 +3788,7 @@ impl Ui {
             rc,
             y,
             &name,
-            gdi::ACC_CPU,
+            gdi::acc().cpu,
             Some(("close app", gdi::rgb(230, 100, 100), Action::KillWatched)),
             false,
         );
@@ -3570,47 +3799,102 @@ impl Ui {
         } else {
             format!("{} running", count)
         };
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, &status);
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, &status);
         y += self.s(24);
 
         let a = watch_sums(&self.snap.procs, &name);
         let fps = watch_fps(&self.snap, &name);
-        let mut rows: Vec<(&str, u32, String, usize, f32)> = Vec::with_capacity(6);
+        let mut rows: Vec<(&str, u32, gdi::Glyph, Figures, usize, Scale)> = Vec::with_capacity(6);
         // FPS leads, but only for apps that are actually presenting frames.
         if fps > 0 || self.watch_rings[5].max() > 0.0 {
             rows.push((
                 "FPS",
-                gdi::ACC_FPS,
-                if fps > 0 { format!("{} fps", fps) } else { "—".to_string() },
+                gdi::acc().fps,
+                gdi::Glyph::Fps,
+                if fps > 0 {
+                    Figures::new(fps.to_string()).unit(Unit::Word("fps"))
+                } else {
+                    Figures::new("—".to_string())
+                },
                 5,
-                self.watch_rings[5].max(),
+                Scale::Fps,
             ));
         }
-        rows.push(("CPU", gdi::ACC_CPU, format!("{:.1}%", a.cpu), 0, 100.0));
+        rows.push((
+            "CPU",
+            gdi::acc().cpu,
+            gdi::Glyph::Cpu,
+            Figures::new(format!("{:.1}%", a.cpu)),
+            0,
+            Scale::Percent,
+        ));
         rows.push((
             "RAM",
-            gdi::ACC_RAM,
-            format_bytes(a.ram_private),
+            gdi::acc().ram,
+            gdi::Glyph::Ram,
+            Figures::new(format_bytes(a.ram_private)),
             1,
-            self.watch_rings[1].max(),
+            // Private bytes have no ceiling of their own, so they take the same
+            // sticky treatment as a rate rather than a window maximum.
+            Scale::Rate,
         ));
-        rows.push(("GPU", gdi::ACC_GPU, format!("{:.1}%", a.gpu), 2, 100.0));
-        rows.push(("Disk", gdi::ACC_DISK, format_rate(a.disk_bps), 3, self.watch_rings[3].max()));
-        rows.push(("Network", gdi::ACC_NET, format_rate(a.net_bps), 4, self.watch_rings[4].max()));
-        let fit = self.fonts.fit_stack();
-        for (label, accent, value, ring_idx, max) in rows {
-            let row = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + self.s(46) };
-            gdi::fill(dc, &row, gdi::t().card);
-            gdi::text(dc, row.left + self.s(10), y + self.s(6), self.fonts.small, accent, label);
-            let spark = RECT {
-                left: row.right - self.s(118),
-                top: y + self.s(7),
-                right: row.right - self.s(8),
-                bottom: y + self.s(39),
+        rows.push((
+            "GPU",
+            gdi::acc().gpu,
+            gdi::Glyph::Gpu,
+            Figures::new(format!("{:.1}%", a.gpu)),
+            2,
+            Scale::Percent,
+        ));
+        rows.push((
+            "Disk",
+            gdi::acc().disk,
+            gdi::Glyph::Disk,
+            Figures::new(format_rate(a.disk_bps)),
+            3,
+            Scale::Rate,
+        ));
+        rows.push((
+            "Network",
+            gdi::acc().net,
+            gdi::Glyph::Net,
+            Figures::new(format_rate(a.net_bps)).unit(Unit::Down),
+            4,
+            Scale::Rate,
+        ));
+        for (label, accent, glyph, figs, ring_idx, scale) in rows {
+            let row = RECT {
+                left: pad,
+                top: y,
+                right: rc.right - pad,
+                bottom: y + self.s(CARD_METRIC),
             };
-            gdi::text_fit(dc, row.left + self.s(10), y + self.s(21), spark.left - self.s(6), &fit, gdi::t().text, &value);
-            gdi::sparkline(dc, &spark, &self.watch_rings[ring_idx], max, accent);
-            y += self.s(52);
+            gdi::card(dc, &row, gdi::t().card, gdi::t().line, self.s(RADIUS));
+            let name_right = self.metric_name(dc, &row, accent, glyph, label);
+            let spark = RECT {
+                left: row.right - self.s(120),
+                top: y + self.s(SP3),
+                right: row.right - self.s(SP4),
+                bottom: y + self.s(40),
+            };
+            let sticky = match ring_idx {
+                1 => &self.ceil_watch_ram,
+                3 => &self.ceil_watch_disk,
+                _ => &self.ceil_watch_net,
+            };
+            let max = scale.ceiling(self.watch_rings[ring_idx].max(), sticky);
+            self.draw_figures(dc, &row, name_right, spark.left - self.s(SP3), &figs);
+            gdi::chart(
+                dc,
+                self.surf.as_ref(),
+                &spark,
+                &self.watch_rings[ring_idx],
+                max,
+                accent,
+                gdi::ChartSize::Row,
+                self.scale,
+            );
+            y += self.s(ROW_METRIC);
         }
 
         // Where this app is talking to, as its own item rather than a hint
@@ -3646,7 +3930,7 @@ impl Ui {
                 dc,
                 pad + self.s(24),
                 y + self.s(4),
-                self.fonts.small,
+                self.fonts.micro,
                 gdi::t().text,
                 &format!("Processes ({})", subs.len()),
             );
@@ -3712,7 +3996,7 @@ impl Ui {
                 let saved = unsafe { SaveDC(dc) };
                 unsafe { IntersectClipRect(dc, 0, list_top, rc.right, rc.bottom) };
                 if labelled.is_empty() {
-                    gdi::text(dc, pad, list_top, self.fonts.small, gdi::t().dim, "No processes match your filter");
+                    gdi::text(dc, pad, list_top, self.fonts.micro, gdi::t().dim, "No processes match your filter");
                 }
                 for (i, (role, p)) in labelled.iter().enumerate() {
                     let ry = list_top + i as i32 * row_h - self.scroll;
@@ -3730,11 +4014,11 @@ impl Ui {
                         format!("{}  ·  PID {}", role, p.pid)
                     };
                     let vs = sub_value_text(p, metric);
-                    let vw = gdi::text_width(dc, self.fonts.small, &vs);
+                    let vw = gdi::text_width(dc, self.fonts.micro, &vs);
                     let vx = kx - self.s(10) - vw;
-                    gdi::text_fit(dc, pad + self.s(6), ry, vx - self.s(6), &[self.fonts.small], gdi::t().text, &title);
-                    gdi::text(dc, vx, ry, self.fonts.small, accent_for(metric), &vs);
-                    gdi::text(dc, kx, ry, self.fonts.normal, gdi::rgb(220, 90, 90), "×");
+                    gdi::text_fit(dc, pad + self.s(6), ry, vx - self.s(6), &[self.fonts.micro], gdi::t().text, &title);
+                    gdi::text(dc, vx, ry, self.fonts.micro, accent_for(metric), &vs);
+                    gdi::text(dc, kx, ry, self.fonts.body, gdi::rgb(220, 90, 90), "×");
                     let kill_hit = RECT {
                         left: kx - self.s(6),
                         top: (ry - self.s(2)).max(list_top),
@@ -3757,7 +4041,7 @@ impl Ui {
         }
         let cx = frame.right - self.s(14);
         let cy = (frame.top + frame.bottom) / 2 - self.s(8);
-        gdi::text(dc, cx, cy, self.fonts.normal, gdi::t().dim, "×");
+        gdi::text(dc, cx, cy, self.fonts.body, gdi::t().dim, "×");
         let hit = RECT {
             left: frame.right - self.s(24),
             top: frame.top,
@@ -3770,14 +4054,14 @@ impl Ui {
     fn draw_fps_apps(&mut self, dc: HDC, rc: &RECT) {
         let pad = self.s(12);
         let mut y = pad;
-        y = self.header(dc, rc, y, "FPS", gdi::ACC_FPS);
+        y = self.header(dc, rc, y, "FPS", gdi::acc().fps);
 
         if !self.snap.etw_ok {
-            gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "Frame rate tracking needs administrator access.");
+            gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "Frame rate tracking needs administrator access.");
             return;
         }
         if self.snap.fps_list.is_empty() {
-            gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "Nothing on screen");
+            gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "Nothing on screen");
             return;
         }
 
@@ -3788,16 +4072,16 @@ impl Ui {
             .map(|(pid, name, _)| (name.clone(), vec![*pid]))
             .collect();
         let list = self.snap.fps_list.clone();
-        let name_fonts = [self.fonts.normal, self.fonts.small];
+        let name_fonts = [self.fonts.body, self.fonts.micro];
         for (idx, (_pid, name, fps)) in list.iter().enumerate() {
             let vs = format!("{} fps", fps);
             let hit = RECT { left: pad, top: y - self.s(2), right: rc.right - pad, bottom: y + self.s(22) };
             if self.hovered(&hit) {
                 gdi::fill(dc, &hit, gdi::t().card_hover);
             }
-            let vw = gdi::text_width(dc, self.fonts.bold_sm, &vs);
+            let vw = gdi::text_width(dc, self.fonts.value_sm, &vs);
             gdi::text_fit(dc, pad + self.s(4), y, rc.right - pad - vw - self.s(16), &name_fonts, gdi::t().text, name);
-            gdi::text_right(dc, rc.right - pad - self.s(4), y, self.fonts.bold_sm, gdi::t().text, &vs);
+            gdi::text_right(dc, rc.right - pad - self.s(4), y, self.fonts.value_sm, gdi::t().text, &vs);
             self.hits.push((hit, Action::Watch(idx)));
             y += self.s(26);
             if y > rc.bottom - self.s(24) {
@@ -3826,13 +4110,13 @@ impl Ui {
         for (page, title, sub) in pages {
             let row = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + self.s(44) };
             self.hover_fill(dc, &row, gdi::t().card);
-            gdi::text(dc, row.left + self.s(10), y + self.s(7), self.fonts.bold_sm, gdi::t().text, title);
+            gdi::text(dc, row.left + self.s(10), y + self.s(7), self.fonts.value_sm, gdi::t().text, title);
             gdi::text_fit(
                 dc,
                 row.left + self.s(10),
                 y + self.s(24),
                 rc.right - pad - self.s(26),
-                &[self.fonts.small],
+                &[self.fonts.micro],
                 gdi::t().dim,
                 sub,
             );
@@ -3854,7 +4138,7 @@ impl Ui {
         let bg_top = RECT { left: 0, top: 0, right: rc.right, bottom: pad };
         gdi::fill(dc, &bg_top, gdi::t().bg);
         let hits_before = self.hits.len();
-        self.header_ex(dc, rc, pad, title, gdi::ACC_CPU, None, true);
+        self.header_ex(dc, rc, pad, title, gdi::acc().cpu, None, true);
         let added: Vec<_> = self.hits.drain(hits_before..).collect();
         for hit in added.into_iter().rev() {
             self.hits.insert(0, hit);
@@ -3891,7 +4175,7 @@ impl Ui {
                 dc,
                 pad + self.s(26),
                 y,
-                self.fonts.small,
+                self.fonts.micro,
                 gdi::rgb(220, 120, 90),
                 "Needs administrator — run the app as admin once",
             );
@@ -3899,7 +4183,7 @@ impl Ui {
         }
 
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "HOW OFTEN TO UPDATE");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "HOW OFTEN TO UPDATE");
         y += self.s(22);
         for (ms, label) in [
             (500u32, "Every half second — most responsive"),
@@ -3910,7 +4194,7 @@ impl Ui {
         }
 
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "THEME");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "THEME");
         y += self.s(22);
         let mut x = pad;
         for (i, th) in gdi::THEMES.iter().enumerate() {
@@ -3919,7 +4203,7 @@ impl Ui {
         y += self.ctrl_row();
 
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "TEXT SIZE");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "TEXT SIZE");
         y += self.s(22);
         let mut x = pad;
         for (i, (label, _)) in config::TEXT_SIZES.iter().enumerate() {
@@ -3929,7 +4213,7 @@ impl Ui {
             dc,
             pad,
             y + self.ctrl_h() + self.s(4),
-            self.fonts.small,
+            self.fonts.micro,
             gdi::t().dim,
             "Scales the whole panel, on top of Windows' own scaling",
         );
@@ -3939,7 +4223,7 @@ impl Ui {
     fn page_ai(&mut self, dc: HDC, rc: &RECT, mut y: i32) -> i32 {
         let pad = self.s(12);
         y = self.check_row(dc, rc, y, "Allow AI tools to connect", self.cfg.mcp_enabled, Action::ToggleMcp);
-        gdi::text(dc, pad + self.s(26), y, self.fonts.small, gdi::t().dim, "Read these stats and send you messages");
+        gdi::text(dc, pad + self.s(26), y, self.fonts.micro, gdi::t().dim, "Read these stats and send you messages");
         y += self.s(18);
         if !self.cfg.mcp_enabled {
             self.notify_text_y = -1;
@@ -3951,7 +4235,7 @@ impl Ui {
         y += self.s(10);
         // The heading carries the shared "when" stem so each row below can
         // drop its own leading "When" and read as a continuation of it.
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "NOTIFY ME WHEN");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "NOTIFY ME WHEN");
         y += self.s(22);
         let presets: [(u32, &str); 4] = [
             (config::NOTIFY_FINISHED, "A build or long task finishes"),
@@ -3968,7 +4252,7 @@ impl Ui {
         // heading because filing them under "notify me when" is what made the
         // input confusing in the first place.
         y += self.s(12);
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "CUSTOM AI REQUESTS");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "CUSTOM AI REQUESTS");
         y += self.s(22);
         // Each toggles like a preset, and carries an × because unlike a preset
         // it can be removed entirely.
@@ -4004,18 +4288,18 @@ impl Ui {
 
         // Timing is not guessable from the controls, and getting it wrong
         // means waiting for a change that will never arrive in this session.
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "You may need to inform your AI tool such as");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "You may need to inform your AI tool such as");
         y += self.s(15);
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "Claude Code to recheck any new notifications");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "Claude Code to recheck any new notifications");
         y += self.s(15);
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "that are added.");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "that are added.");
         y += self.s(20);
 
         // Agent history is kept for the session by default; a file makes it
         // survive a restart. Empty path means off, as it does for an alert
         // rule's file.
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "AGENT HISTORY");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "AGENT HISTORY");
         y += self.s(22);
         let logging = !self.cfg.agent_log_file.trim().is_empty();
         y = self.check_row(dc, rc, y, "Also save finished agents to a file", logging, Action::ToggleAgentLog);
@@ -4025,7 +4309,7 @@ impl Ui {
                 pad + self.s(26),
                 y,
                 rc.right - pad,
-                &[self.fonts.small],
+                &[self.fonts.micro],
                 gdi::t().dim,
                 &self.cfg.agent_log_file,
             );
@@ -4040,7 +4324,7 @@ impl Ui {
 
     fn page_desktop(&mut self, dc: HDC, rc: &RECT, mut y: i32) -> i32 {
         let pad = self.s(12);
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "TASKBAR WIDGET");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "TASKBAR WIDGET");
         y += self.s(22);
         y = self.check_row(
             dc,
@@ -4070,7 +4354,7 @@ impl Ui {
             y += self.ctrl_row();
 
             y += self.s(6);
-            gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "WIDGET THEME");
+            gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "WIDGET THEME");
             y += self.s(22);
             let mut x = pad;
             for (i, th) in gdi::THEMES.iter().enumerate() {
@@ -4080,7 +4364,7 @@ impl Ui {
         }
 
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "FRAME RATE COUNTER");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "FRAME RATE COUNTER");
         y += self.s(22);
         y = self.check_row(
             dc,
@@ -4091,13 +4375,13 @@ impl Ui {
             Action::ToggleFpsOverlay,
         );
         {
-            gdi::text(dc, pad, y + self.s(4), self.fonts.small, gdi::t().dim, "color");
+            gdi::text(dc, pad, y + self.s(4), self.fonts.micro, gdi::t().dim, "color");
             let mut x = pad + self.s(50);
             for (i, (label, _)) in super::overlay::COLORS.iter().enumerate() {
                 x = self.chip(dc, x, y, label, self.cfg.fps_color as usize == i, Action::FpsColor(i));
             }
             y += self.ctrl_row();
-            gdi::text(dc, pad, y + self.s(4), self.fonts.small, gdi::t().dim, "opacity");
+            gdi::text(dc, pad, y + self.s(4), self.fonts.micro, gdi::t().dim, "opacity");
             let mut x = pad + self.s(50);
             for (i, (label, _)) in super::overlay::OPACITIES.iter().enumerate() {
                 x = self.chip(dc, x, y, label, self.cfg.fps_opacity as usize == i, Action::FpsOpacity(i));
@@ -4106,7 +4390,7 @@ impl Ui {
         }
 
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "TASKBAR TRAY ICONS");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "TASKBAR TRAY ICONS");
         y += self.s(22);
         let items: [(usize, &str, bool); 6] = [
             (0, "App icon", self.cfg.tray_static),
@@ -4124,7 +4408,7 @@ impl Ui {
 
     fn page_alerts(&mut self, dc: HDC, rc: &RECT, mut y: i32) -> i32 {
         let pad = self.s(12);
-        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, "Each alert chooses its own delivery.");
+        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "Each alert chooses its own delivery.");
         y += self.s(22);
         let lines = self.cfg.rule_lines.clone();
         for (idx, line) in lines.iter().enumerate() {
@@ -4211,10 +4495,10 @@ impl Ui {
         let l = self.rule_edit_layout();
 
         let mut hy = pad;
-        hy = self.header(dc, rc, hy, "New alert", gdi::ACC_NET);
+        hy = self.header(dc, rc, hy, "New alert", gdi::acc().net);
         let _ = hy;
 
-        gdi::text(dc, pad, l.y_metric, self.fonts.small, gdi::t().dim, "ALERT ME WHEN");
+        gdi::text(dc, pad, l.y_metric, self.fonts.micro, gdi::t().dim, "ALERT ME WHEN");
         let cols = 2;
         let cell_w = (rc.right - 2 * pad - self.s(6)) / cols;
         for (i, (_, label, _)) in R_METRICS.iter().enumerate() {
@@ -4222,25 +4506,25 @@ impl Ui {
             let cy = l.y_grid + (i as i32 / cols) * self.s(24);
             let r = RECT { left: cx, top: cy, right: cx + cell_w, bottom: cy + self.s(20) };
             let active = self.draft.metric == i;
-            gdi::fill(dc, &r, if active { gdi::ACC_CPU } else { gdi::t().card });
+            gdi::fill(dc, &r, if active { gdi::acc().cpu } else { gdi::t().card });
             gdi::text(
                 dc,
                 cx + self.s(8),
                 cy + self.s(3),
-                self.fonts.small,
-                if active { gdi::rgb(15, 17, 20) } else { gdi::t().text },
+                self.fonts.micro,
+                if active { gdi::on(gdi::acc().cpu) } else { gdi::t().text },
                 label,
             );
             self.hits.push((r, Action::DraftMetric(i)));
         }
 
         if l.conn {
-            gdi::text(dc, pad, l.y_when + self.s(4), self.fonts.small, gdi::t().dim, "match");
+            gdi::text(dc, pad, l.y_when + self.s(4), self.fonts.micro, gdi::t().dim, "match");
             let mut x = pad + self.s(48);
             for (i, (_, label)) in R_CONN_FIELDS.iter().enumerate() {
                 x = self.chip(dc, x, l.y_when, label, self.draft.conn_field == i, Action::DraftConnField(i));
             }
-            gdi::text(dc, pad, l.y_name + self.s(2), self.fonts.small, gdi::t().dim, "is");
+            gdi::text(dc, pad, l.y_name + self.s(2), self.fonts.micro, gdi::t().dim, "is");
             gdi::input_frame(
                 dc,
                 &RECT {
@@ -4251,14 +4535,14 @@ impl Ui {
                 },
             );
         } else {
-            gdi::text(dc, pad, l.y_when + self.s(4), self.fonts.small, gdi::t().dim, "goes");
+            gdi::text(dc, pad, l.y_when + self.s(4), self.fonts.micro, gdi::t().dim, "goes");
             let mut x = pad + self.s(40);
             x = self.chip(dc, x, l.y_when, "above", self.draft.gt, Action::DraftDir(true));
             self.chip(dc, x, l.y_when, "below", !self.draft.gt, Action::DraftDir(false));
         }
 
         if l.proc {
-            gdi::text(dc, pad, l.y_name + self.s(2), self.fonts.small, gdi::t().dim, "app");
+            gdi::text(dc, pad, l.y_name + self.s(2), self.fonts.micro, gdi::t().dim, "app");
             let field_right = rc.right - pad - self.s(52);
             gdi::input_frame(
                 dc,
@@ -4277,9 +4561,9 @@ impl Ui {
                 bottom: l.y_name + self.s(21),
             };
             gdi::fill(dc, &pick, gdi::t().card);
-            gdi::text(dc, pick.left + self.s(7), l.y_name + self.s(2), self.fonts.small, gdi::ACC_CPU, "pick ▾");
+            gdi::text(dc, pick.left + self.s(7), l.y_name + self.s(2), self.fonts.micro, gdi::acc().cpu, "pick ▾");
             self.hits.push((pick, Action::PickApp));
-            gdi::text(dc, pad, l.y_sub + self.s(4), self.fonts.small, gdi::t().dim, "measuring");
+            gdi::text(dc, pad, l.y_sub + self.s(4), self.fonts.micro, gdi::t().dim, "measuring");
             let mut x = pad + self.s(60);
             for (i, (_, label)) in R_PROC_SUBS.iter().enumerate() {
                 x = self.chip(dc, x, l.y_sub, label, self.draft.proc_sub == i, Action::DraftProcSub(i));
@@ -4290,7 +4574,7 @@ impl Ui {
         // not drawn at all rather than drawn and ignored.
         if !l.conn {
             let unit = if l.proc { "" } else { R_METRICS[self.draft.metric].2 };
-            gdi::text(dc, pad, l.y_thresh + self.s(2), self.fonts.small, gdi::t().dim, "reaches");
+            gdi::text(dc, pad, l.y_thresh + self.s(2), self.fonts.micro, gdi::t().dim, "reaches");
             gdi::input_frame(
                 dc,
                 &RECT {
@@ -4300,20 +4584,20 @@ impl Ui {
                     bottom: l.y_thresh - self.s(3) + self.ctrl_h(),
                 },
             );
-            gdi::text(dc, pad + self.s(150), l.y_thresh + self.s(2), self.fonts.small, gdi::t().dim, unit);
+            gdi::text(dc, pad + self.s(150), l.y_thresh + self.s(2), self.fonts.micro, gdi::t().dim, unit);
         }
 
         // Delivery is per alert. The three chips are exhaustive, which is why
         // there is no separate "optional" hint on the path row any more — that
         // label used to be drawn straight through the input frame.
-        gdi::text(dc, pad, l.y_deliver + self.s(4), self.fonts.small, gdi::t().dim, "deliver by");
+        gdi::text(dc, pad, l.y_deliver + self.s(4), self.fonts.micro, gdi::t().dim, "deliver by");
         let mut x = pad + self.s(66);
         for (i, label) in ["desktop", "file", "both"].iter().enumerate() {
             x = self.chip(dc, x, l.y_deliver, label, self.draft.deliver == i, Action::DraftDeliver(i));
         }
 
         if l.file {
-            gdi::text(dc, pad, l.y_file + self.s(2), self.fonts.small, gdi::t().dim, "log file");
+            gdi::text(dc, pad, l.y_file + self.s(2), self.fonts.micro, gdi::t().dim, "log file");
             gdi::input_frame(
                 dc,
                 &RECT {
@@ -4376,7 +4660,7 @@ impl Ui {
                 right: box_r.right - self.s(3),
                 bottom: box_r.bottom - self.s(3),
             };
-            gdi::fill(dc, &inner, gdi::ACC_CPU);
+            gdi::fill(dc, &inner, gdi::acc().cpu);
         }
         let del_x = rc.right - pad - self.s(18);
         // Delete hit is pushed first so the × is not swallowed by the row.
@@ -4385,8 +4669,8 @@ impl Ui {
         let toggle_hit = RECT { left: pad, top: y - self.s(2), right: del_x - self.s(8), bottom: y + self.s(20) };
         self.hits.push((toggle_hit, toggle));
         let color = if checked { gdi::t().text } else { gdi::t().dim };
-        gdi::text_fit(dc, pad + self.s(26), y + self.s(1), del_x - self.s(8), &[self.fonts.small], color, label);
-        gdi::text(dc, del_x, y, self.fonts.normal, gdi::rgb(220, 90, 90), "×");
+        gdi::text_fit(dc, pad + self.s(26), y + self.s(1), del_x - self.s(8), &[self.fonts.micro], color, label);
+        gdi::text(dc, del_x, y, self.fonts.body, gdi::rgb(220, 90, 90), "×");
         y + self.s(24)
     }
 
@@ -4416,7 +4700,7 @@ impl Ui {
                 if d == i && !dragging {
                     let line_y = if d > self.metric_drag.unwrap_or(0) { ry + self.s(20) } else { ry - self.s(2) };
                     let line = RECT { left: pad, top: line_y, right: rc.right - pad, bottom: line_y + self.s(2) };
-                    gdi::fill(dc, &line, gdi::ACC_CPU);
+                    gdi::fill(dc, &line, gdi::acc().cpu);
                 }
             }
 
@@ -4425,7 +4709,7 @@ impl Ui {
             for b in 0..3 {
                 let by = ry + self.s(4) + b * self.s(4);
                 let bar = RECT { left: grip_x, top: by, right: grip_x + self.s(10), bottom: by + self.s(2) };
-                gdi::fill(dc, &bar, if dragging { gdi::ACC_CPU } else { gdi::t().dim });
+                gdi::fill(dc, &bar, if dragging { gdi::acc().cpu } else { gdi::t().dim });
             }
             let grip_hit = RECT { left: pad, top: ry - self.s(2), right: grip_x + self.s(16), bottom: ry + self.s(20) };
             self.hits.push((grip_hit, Action::MetricDragStart(i)));
@@ -4444,10 +4728,12 @@ impl Ui {
                     right: box_r.right - self.s(3),
                     bottom: box_r.bottom - self.s(3),
                 };
-                gdi::fill(dc, &inner, gdi::ACC_CPU);
+                gdi::fill(dc, &inner, gdi::acc().cpu);
             }
-            let (label, accent) = metric_label(name);
-            gdi::text(dc, box_r.right + self.s(8), ry, self.fonts.normal, accent, label);
+            // Mixed case here, not the row's uppercase: this is a settings list
+            // of names, not the metric's identity band.
+            let (label, accent, _) = metric_label(name);
+            gdi::text(dc, box_r.right + self.s(SP3), ry, self.fonts.body, accent, label);
             let toggle_hit =
                 RECT { left: box_r.left - self.s(4), top: ry - self.s(2), right: rc.right - pad, bottom: ry + self.s(20) };
             self.hits.push((toggle_hit, Action::MetricVisible(i)));
@@ -4456,7 +4742,7 @@ impl Ui {
         ry += self.s(6);
         // Kept despite the copy rules: a drag handle is the only affordance
         // for this gesture, so the hint teaches rather than restates.
-        gdi::text(dc, pad, ry, self.fonts.small, gdi::t().dim, "Drag ≡ to reorder");
+        gdi::text(dc, pad, ry, self.fonts.micro, gdi::t().dim, "Drag ≡ to reorder");
         ry + self.s(20)
     }
 
@@ -4480,9 +4766,9 @@ impl Ui {
                 right: box_r.right - self.s(3),
                 bottom: box_r.bottom - self.s(3),
             };
-            gdi::fill(dc, &inner, gdi::ACC_CPU);
+            gdi::fill(dc, &inner, gdi::acc().cpu);
         }
-        gdi::text(dc, pad + self.s(26), y, self.fonts.normal, gdi::t().text, label);
+        gdi::text(dc, pad + self.s(26), y, self.fonts.body, gdi::t().text, label);
         let hit = RECT { left: pad, top: y - self.s(2), right: rc.right - pad, bottom: y + self.s(20) };
         self.hits.push((hit, action));
         y + self.s(24)
@@ -4499,16 +4785,63 @@ struct ProcLayout {
 
 /// Display label and accent for a `main_metrics` name — the single map both
 /// `draw_main` and the settings list draw from.
-fn metric_label(name: &str) -> (&'static str, u32) {
+fn metric_label(name: &str) -> (&'static str, u32, gdi::Glyph) {
     match name {
-        "cpu" => ("CPU", gdi::ACC_CPU),
-        "ram" => ("RAM", gdi::ACC_RAM),
-        "gpu" => ("GPU", gdi::ACC_GPU),
-        "fps" => ("FPS", gdi::ACC_FPS),
-        "disk" => ("Disk", gdi::ACC_DISK),
-        "net" => ("Network", gdi::ACC_NET),
-        "audio" => ("Sound", gdi::ACC_AUDIO),
-        _ => ("?", gdi::ACC_CPU),
+        "cpu" => ("CPU", gdi::acc().cpu, gdi::Glyph::Cpu),
+        "ram" => ("RAM", gdi::acc().ram, gdi::Glyph::Ram),
+        "gpu" => ("GPU", gdi::acc().gpu, gdi::Glyph::Gpu),
+        "fps" => ("FPS", gdi::acc().fps, gdi::Glyph::Fps),
+        "disk" => ("Disk", gdi::acc().disk, gdi::Glyph::Disk),
+        "net" => ("Network", gdi::acc().net, gdi::Glyph::Net),
+        "audio" => ("Sound", gdi::acc().audio, gdi::Glyph::Audio),
+        _ => ("?", gdi::acc().cpu, gdi::Glyph::Cpu),
+    }
+}
+
+/// Nominal size of a metric glyph in a row. Design px, before `scale`.
+const GLYPH: i32 = 13;
+
+/// Nominal size of a direction marker beside a value, and beside a secondary
+/// figure. Design px, before `scale`.
+const MARKER: i32 = 10;
+const MARKER_SM: i32 = 9;
+
+/// The unit that sits beside a figure.
+#[derive(Copy, Clone, PartialEq)]
+enum Unit {
+    None,
+    /// A word in `micro`/`mute`: `used`, `read`, `fps`.
+    Word(&'static str),
+    /// A direction marker glyph. Only the network rates take these. `read` and
+    /// `write` stay words on purpose — they are not directions, and an arrow
+    /// beside a disk read rate would imply the disk is downloading.
+    Down,
+    Up,
+}
+
+/// The right-hand side of a metric row: one value on the card's centre line,
+/// its unit beside it, and at most one secondary figure hung off the bottom.
+struct Figures {
+    value: String,
+    unit: Unit,
+    sub: Option<String>,
+    sub_unit: Unit,
+}
+
+impl Figures {
+    fn new(value: String) -> Self {
+        Figures { value, unit: Unit::None, sub: None, sub_unit: Unit::None }
+    }
+
+    fn unit(mut self, u: Unit) -> Self {
+        self.unit = u;
+        self
+    }
+
+    fn sub(mut self, s: String, u: Unit) -> Self {
+        self.sub = Some(s);
+        self.sub_unit = u;
+        self
     }
 }
 
@@ -4574,12 +4907,12 @@ fn sub_value_text(p: &ProcStat, metric: Metric) -> String {
 
 fn accent_for(metric: Metric) -> u32 {
     match metric {
-        Metric::Cpu => gdi::ACC_CPU,
-        Metric::Ram => gdi::ACC_RAM,
-        Metric::Gpu => gdi::ACC_GPU,
-        Metric::Disk => gdi::ACC_DISK,
-        Metric::Net => gdi::ACC_NET,
-        Metric::Audio => gdi::ACC_AUDIO,
+        Metric::Cpu => gdi::acc().cpu,
+        Metric::Ram => gdi::acc().ram,
+        Metric::Gpu => gdi::acc().gpu,
+        Metric::Disk => gdi::acc().disk,
+        Metric::Net => gdi::acc().net,
+        Metric::Audio => gdi::acc().audio,
     }
 }
 

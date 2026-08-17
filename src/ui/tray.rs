@@ -29,11 +29,11 @@ const K_FPS: usize = 5;
 
 fn accent(kind: usize) -> u32 {
     match kind {
-        K_CPU => gdi::ACC_CPU,
-        K_RAM => gdi::ACC_RAM,
-        K_DISK => gdi::ACC_DISK,
-        K_NET => gdi::ACC_NET,
-        K_FPS => gdi::ACC_FPS,
+        K_CPU => gdi::acc().cpu,
+        K_RAM => gdi::acc().ram,
+        K_DISK => gdi::acc().disk,
+        K_NET => gdi::acc().net,
+        K_FPS => gdi::acc().fps,
         _ => rgb(90, 130, 200),
     }
 }

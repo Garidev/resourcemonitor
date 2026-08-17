@@ -6,7 +6,157 @@
 pub const CTRL_H: i32 = 24;
 
 /// Gap below a row of controls before the next thing starts.
-pub const CTRL_GAP: i32 = 6;
+pub const CTRL_GAP: i32 = SP3;
+
+// ── Spacing scale ────────────────────────────────────────────────────────────
+//
+// Base unit 4, eight steps. These replace the twenty-one distinct `s(n)` values
+// `draw_main` alone used to carry, and they are what makes `panel_height`
+// derivable from the same numbers the paint code uses instead of a
+// hand-maintained sum that had to agree with it by inspection.
+
+/// Flush.
+/// Part of the published scale; not yet consumed — see the sequencing table
+/// in `docs/design/ui-foundation.md` §9 for which step claims it.
+#[allow(dead_code)]
+pub const SP0: i32 = 0;
+/// Hairlines, icon-to-baseline nudges, mark gaps.
+pub const SP1: i32 = 2;
+/// Inside a control; a chip's vertical padding.
+pub const SP2: i32 = 4;
+/// Between a label and its value; icon to text.
+pub const SP3: i32 = 8;
+/// The panel gutter, and the gap inside a card.
+pub const SP4: i32 = 12;
+/// Between rows of related controls.
+/// Part of the published scale; not yet consumed — see the sequencing table
+/// in `docs/design/ui-foundation.md` §9 for which step claims it.
+#[allow(dead_code)]
+pub const SP5: i32 = 16;
+/// Between sections.
+/// Part of the published scale; not yet consumed — see the sequencing table
+/// in `docs/design/ui-foundation.md` §9 for which step claims it.
+#[allow(dead_code)]
+pub const SP6: i32 = 24;
+/// Above a section heading that follows content.
+/// Part of the published scale; not yet consumed — see the sequencing table
+/// in `docs/design/ui-foundation.md` §9 for which step claims it.
+#[allow(dead_code)]
+pub const SP7: i32 = 32;
+
+// Derived rhythms, all multiples of 4.
+
+/// A list row: process lists, agent rows, connection rows.
+pub const ROW_LIST: i32 = 28;
+/// A navigation row in settings.
+pub const ROW_NAV: i32 = 32;
+/// Navigation row plus the gap to the next.
+pub const ROW_NAV_STRIDE: i32 = 40;
+/// The metric row card itself.
+pub const CARD_METRIC: i32 = 48;
+/// Metric card plus the gap to the next card.
+pub const ROW_METRIC: i32 = 56;
+/// The header strip holding search and the window controls.
+/// Part of the published scale; not yet consumed — see the sequencing table
+/// in `docs/design/ui-foundation.md` §9 for which step claims it.
+#[allow(dead_code)]
+pub const HEADER_H: i32 = 40;
+/// Header strip plus the gap below it.
+/// Part of the published scale; not yet consumed — see the sequencing table
+/// in `docs/design/ui-foundation.md` §9 for which step claims it.
+#[allow(dead_code)]
+pub const HEADER_STRIDE: i32 = 52;
+
+/// Corner radius on cards, chips, input frames, chart plates and the widget
+/// strip. Nothing in the product is fully round: a pill chip at `CTRL_H = 24`
+/// would fight the rectangular data it sits beside.
+pub const RADIUS: i32 = 4;
+
+/// Nearest 1 / 2 / 5 × 10ⁿ at or above `v`. Quantising the ceiling is what
+/// stops a decaying maximum from nudging the axis on every tick: the ceiling
+/// only moves when the decay crosses a step boundary.
+pub fn nice(v: f32) -> f32 {
+    if !v.is_finite() || v <= 0.0 {
+        return 1.0;
+    }
+    let p = 10f32.powf(v.log10().floor());
+    let m = v / p;
+    p * if m <= 1.0 {
+        1.0
+    } else if m <= 2.0 {
+        2.0
+    } else if m <= 5.0 {
+        5.0
+    } else {
+        10.0
+    }
+}
+
+/// How a chart decides its y-axis ceiling.
+///
+/// This is the fix that matters most in the whole redesign. Every chart used to
+/// pass `ring.max()`, so the axis rescaled on almost every tick: fifty-seven
+/// unchanged samples would visibly collapse to a third of their height the
+/// moment a spike entered the window. The graph moved while the data did not.
+#[derive(Copy, Clone, PartialEq)]
+pub enum Scale {
+    /// A percentage. Pinned to 100 and never rescales, ever.
+    Percent,
+    /// Frames per second: `nice(max(60, window_max))`, so a 60/120/144 Hz
+    /// display holds one stable frame instead of breathing.
+    Fps,
+    /// A rate with no natural ceiling — bytes per second. Rises instantly to
+    /// meet a spike, then decays slowly, quantised on the way.
+    Rate,
+    /// A fixed known ceiling, e.g. total installed RAM. Not yet used by a
+    /// caller; kept because the hero chart needs it.
+    #[allow(dead_code)]
+    Fixed(f32),
+}
+
+/// The sticky part of [`Scale::Rate`] — one `f32` per ring.
+#[derive(Default)]
+pub struct Ceiling {
+    raw: f32,
+}
+
+/// Fraction of the raw ceiling retained per tick. ~7 % decay: fast enough that
+/// a finished download stops dominating the axis within a window, slow enough
+/// that a bursty transfer does not pump.
+const CEIL_DECAY: f32 = 0.93;
+
+impl Ceiling {
+    /// Advance one tick against this window's maximum and return the ceiling to
+    /// draw with. Call exactly once per sample per chart.
+    pub fn update(&mut self, window_max: f32) -> f32 {
+        let m = if window_max.is_finite() { window_max.max(0.0) } else { 0.0 };
+        self.raw = m.max(self.raw * CEIL_DECAY);
+        nice(self.raw)
+    }
+
+    /// The ceiling without advancing the decay — for repaints that are not
+    /// driven by a new sample (hover, resize, theme change).
+    #[allow(dead_code)]
+    pub fn peek_raw(&self) -> f32 {
+        self.raw
+    }
+
+    pub fn peek(&self) -> f32 {
+        nice(self.raw)
+    }
+}
+
+impl Scale {
+    /// Resolve to a ceiling. `sticky` is only consulted for [`Scale::Rate`].
+    pub fn ceiling(self, window_max: f32, sticky: &Ceiling) -> f32 {
+        match self {
+            Scale::Percent => 100.0,
+            Scale::Fps => nice(window_max.max(60.0)),
+            Scale::Rate => sticky.peek(),
+            Scale::Fixed(v) => v.max(1.0),
+        }
+    }
+}
 
 /// Scale a design-time pixel value for the current DPI.
 pub fn scaled(v: i32, scale: f32) -> i32 {
@@ -300,6 +450,79 @@ pub fn json_objects(arr: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nice_quantises_to_1_2_5_decades() {
+        assert_eq!(nice(0.0), 1.0);
+        assert_eq!(nice(-5.0), 1.0);
+        assert_eq!(nice(f32::NAN), 1.0);
+        assert_eq!(nice(1.0), 1.0);
+        assert_eq!(nice(1.5), 2.0);
+        assert_eq!(nice(2.0), 2.0);
+        assert_eq!(nice(4.9), 5.0);
+        assert_eq!(nice(5.1), 10.0);
+        assert_eq!(nice(37.0), 50.0);
+        assert_eq!(nice(1_200_000.0), 2_000_000.0);
+    }
+
+    #[test]
+    fn percent_scale_never_moves() {
+        // The whole point: a percentage chart's axis is a constant, so the
+        // history cannot shift under a spike.
+        let c = Ceiling::default();
+        for m in [0.0, 3.0, 41.7, 99.9, 100.0] {
+            assert_eq!(Scale::Percent.ceiling(m, &c), 100.0);
+        }
+    }
+
+    #[test]
+    fn fps_scale_holds_a_stable_frame() {
+        let c = Ceiling::default();
+        // An idle or 60 Hz display sits on one ceiling rather than breathing.
+        assert_eq!(Scale::Fps.ceiling(0.0, &c), 100.0);
+        assert_eq!(Scale::Fps.ceiling(59.0, &c), 100.0);
+        assert_eq!(Scale::Fps.ceiling(144.0, &c), 200.0);
+    }
+
+    #[test]
+    fn rate_ceiling_rises_at_once_and_decays_slowly() {
+        let mut c = Ceiling::default();
+        // Rises instantly to meet a spike.
+        assert_eq!(c.update(30.0), 50.0);
+        // Traffic stops. The ceiling must not snap down with it, or the
+        // remaining history would leap up the plot on the very next frame.
+        assert_eq!(c.update(0.0), 50.0);
+        assert_eq!(c.update(0.0), 50.0);
+        // ...but it does eventually come down.
+        let mut ticks = 0;
+        while c.peek() > 5.0 && ticks < 500 {
+            c.update(0.0);
+            ticks += 1;
+        }
+        assert!(ticks > 20, "decay should take tens of ticks, took {ticks}");
+        assert!(ticks < 200, "decay should not take forever, took {ticks}");
+    }
+
+    #[test]
+    fn rate_ceiling_is_stable_across_ordinary_variation() {
+        // The failure this replaces: a window whose max wobbles between 30 and
+        // 45 used to rescale the axis on nearly every tick. Quantising means
+        // the drawn ceiling is identical throughout.
+        let mut c = Ceiling::default();
+        c.update(45.0);
+        let first = c.peek();
+        for m in [30.0, 44.0, 33.0, 41.0, 38.0, 45.0, 31.0] {
+            assert_eq!(c.update(m), first, "ceiling moved on a {m} sample");
+        }
+    }
+
+    #[test]
+    fn rate_ceiling_survives_nonsense_input() {
+        let mut c = Ceiling::default();
+        assert!(c.update(f32::NAN).is_finite());
+        assert!(c.update(f32::INFINITY).is_finite());
+        assert!(c.update(-1.0).is_finite());
+    }
 
     #[test]
     fn json_field_reads_strings_and_escapes() {
