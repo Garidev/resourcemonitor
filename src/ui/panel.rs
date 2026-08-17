@@ -27,7 +27,7 @@ use crate::config::{self, Settings};
 use crate::conns;
 use crate::rules;
 use crate::sampler::{ProcStat, Shared, Snapshot, WM_APP_NOTIFY, WM_APP_SNAPSHOT};
-use crate::util::{format_bytes, format_pct, format_rate, Ring};
+use crate::util::{format_bytes, format_pct, format_rate, NavTrail, Ring};
 
 const IDM_EXIT: u32 = 100;
 const IDM_AUTOSTART: u32 = 101;
@@ -239,6 +239,11 @@ pub struct Ui {
     hist_audio: Ring,
     hist_fps: Ring,
     view: View,
+    /// Views passed through to reach the current one. A single trail rather
+    /// than a "came from" field per view: two views each remembering the other
+    /// is a loop with no way out, which is exactly what a watched app and its
+    /// connection list used to do.
+    nav: NavTrail<View>,
     hits: Vec<(RECT, Action)>,
     /// (image name, pids) for rows currently shown in a drill/find view.
     drawn_rows: Vec<(String, Vec<u32>)>,
@@ -253,8 +258,6 @@ pub struct Ui {
     /// Narrows the connection view to one app, set when it is opened from a
     /// watched app rather than from the network drill-down.
     conns_for: Option<String>,
-    /// Where the back chevron goes from the connection view.
-    conns_back: View,
     fonts: Fonts,
     /// Everything is laid out in units of `scale`, so the text-size preference
     /// rides on this rather than on font heights alone — the panel grows with
@@ -300,7 +303,7 @@ pub struct Ui {
     max_scroll: i32,
     /// Image name being watched in the Process view, plus where to go back to.
     watch: Option<String>,
-    watch_back: View,
+
     /// cpu %, ram bytes, gpu %, disk B/s, net B/s history for the watched app.
     watch_rings: Vec<Ring>,
     draft: RuleDraft,
@@ -512,7 +515,6 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         conn_total: 0,
         conns_swept: 0,
         conns_for: None,
-        conns_back: View::Drill(Metric::Net),
         fonts,
         scale,
         dpi_scale,
@@ -536,7 +538,7 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         scroll: 0,
         max_scroll: 0,
         watch: None,
-        watch_back: View::Main,
+        nav: NavTrail::new(16),
         watch_rings: (0..6).map(|_| Ring::new(60)).collect(),
         draft: RuleDraft::default(),
         overlay: std::ptr::null_mut(),
@@ -780,29 +782,17 @@ impl Ui {
                 const VK_ESCAPE: usize = 0x1B;
                 if wparam == VK_ESCAPE {
                     match self.view {
-                        View::Process => {
-                            let back = self.watch_back;
-                            self.change_view(hwnd, back);
-                        }
-                        View::RuleEdit => {
-                            self.change_view(hwnd, View::SettingsPage(SettingsPage::Alerts))
-                        }
                         // Escape steps back one level, so a settings page
                         // returns to the menu rather than leaving outright.
-                        View::SettingsPage(_) => self.change_view(hwnd, View::Settings),
-                        // Likewise the connection list returns to whichever
-                        // view opened it, not all the way out.
-                        View::Connections => {
-                            let back = self.conns_back;
-                            self.change_view(hwnd, back);
-                        }
-                        View::Drill(_)
+                        View::Process
+                        | View::RuleEdit
+                        | View::SettingsPage(_)
+                        | View::Connections
+                        | View::Drill(_)
                         | View::Settings
                         | View::FpsApps
                         | View::McpMessages
-                        | View::Activity => {
-                            self.change_view(hwnd, View::Main)
-                        }
+                        | View::Activity => self.go_back(hwnd),
                         View::Main => {
                             if !self.filter.is_empty() {
                                 // Clear state directly — SetWindowText doesn't
@@ -1058,7 +1048,7 @@ impl Ui {
         // An alert has no entry in the messages list, so it only raises the
         // panel and leaves the user where they were.
         if let Some(view) = self.balloon_target.take() {
-            self.change_view(hwnd, view);
+            self.navigate(hwnd, view);
             if matches!(view, View::McpMessages) {
                 // The message it was about went to the front of the list.
                 // Indices shift as messages arrive, so anything opened earlier
@@ -1207,6 +1197,25 @@ impl Ui {
         }
     }
 
+    /// Move forward to `view`, recording where we came from.
+    ///
+    /// Revisiting a view already on the trail collapses back to it rather than
+    /// stacking a second copy. That is what keeps two views that can each open
+    /// the other — a watched app and its connection list — from pointing at
+    /// each other forever: the trail can only ever shrink back to a view it
+    /// already holds, so Back always makes progress.
+    fn navigate(&mut self, hwnd: HWND, view: View) {
+        self.nav.advance(self.view, view);
+        self.change_view(hwnd, view);
+    }
+
+    /// Step back one level. An empty trail means we are as far back as the
+    /// panel goes, which is the main view.
+    fn go_back(&mut self, hwnd: HWND) {
+        let back = self.nav.back().unwrap_or(View::Main);
+        self.change_view(hwnd, back);
+    }
+
     fn change_view(&mut self, hwnd: HWND, view: View) {
         // Free-text instructions are only written to disk on the way out of
         // settings, rather than on every keystroke.
@@ -1324,32 +1333,21 @@ impl Ui {
         match a {
             Action::Drill(m) => {
                 // Keep any entered filter text — it persists until cleared.
-                self.change_view(hwnd, View::Drill(m));
+                self.navigate(hwnd, View::Drill(m));
             }
             Action::Back => {
-                let back = match self.view {
-                    View::Process => self.watch_back,
-                    View::Connections => self.conns_back,
-                    // Alerts are edited from their own page, so that is where
-                    // saving or cancelling a rule returns to.
-                    View::RuleEdit => View::SettingsPage(SettingsPage::Alerts),
-                    View::SettingsPage(_) => View::Settings,
-                    _ => View::Main,
-                };
-                self.change_view(hwnd, back);
+                self.go_back(hwnd);
             }
             Action::ShowConns => {
                 self.conns_for = None;
-                self.conns_back = View::Drill(Metric::Net);
-                self.change_view(hwnd, View::Connections);
+                self.navigate(hwnd, View::Connections);
             }
             Action::ShowAppConns => {
                 self.conns_for = self.watch.clone();
-                self.conns_back = View::Process;
-                self.change_view(hwnd, View::Connections);
+                self.navigate(hwnd, View::Connections);
             }
-            Action::OpenSettings => self.change_view(hwnd, View::Settings),
-            Action::OpenSettingsPage(p) => self.change_view(hwnd, View::SettingsPage(p)),
+            Action::OpenSettings => self.navigate(hwnd, View::Settings),
+            Action::OpenSettingsPage(p) => self.navigate(hwnd, View::SettingsPage(p)),
             Action::TogglePin => {
                 self.set_pinned(hwnd, !self.cfg.pinned);
             }
@@ -1445,11 +1443,10 @@ impl Ui {
             Action::Watch(idx) => {
                 if let Some((name, _)) = self.drawn_rows.get(idx).cloned() {
                     self.watch = Some(name);
-                    self.watch_back = if matches!(self.view, View::Main) { View::Main } else { self.view };
                     for r in &mut self.watch_rings {
                         *r = Ring::new(60);
                     }
-                    self.change_view(hwnd, View::Process);
+                    self.navigate(hwnd, View::Process);
                 }
             }
             Action::KillWatched => {
@@ -1528,7 +1525,7 @@ impl Ui {
                     .map(|p| format!("{}\\resmon-alerts.log", p))
                     .unwrap_or_else(|_| "C:\\resmon-alerts.log".to_string());
                 set_text(self.edit_path, &default_path);
-                self.change_view(hwnd, View::RuleEdit);
+                self.navigate(hwnd, View::RuleEdit);
             }
             Action::DraftMetric(i) => {
                 self.draft.metric = i;
@@ -1563,21 +1560,21 @@ impl Ui {
             }
             Action::DraftSave => {
                 if self.save_draft() {
-                    self.change_view(hwnd, View::SettingsPage(SettingsPage::Alerts));
+                    self.navigate(hwnd, View::SettingsPage(SettingsPage::Alerts));
                 } else {
                     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
                 }
             }
-            Action::DraftCancel => self.change_view(hwnd, View::SettingsPage(SettingsPage::Alerts)),
+            Action::DraftCancel => self.navigate(hwnd, View::SettingsPage(SettingsPage::Alerts)),
             Action::PickApp => self.pick_app_menu(hwnd),
-            Action::ShowFpsApps => self.change_view(hwnd, View::FpsApps),
+            Action::ShowFpsApps => self.navigate(hwnd, View::FpsApps),
             Action::TogglePause => {
                 self.paused = !self.paused;
                 self.frozen = if self.paused { Some(self.snap.clone()) } else { None };
                 unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
             }
-            Action::ShowMcp => self.change_view(hwnd, View::McpMessages),
-            Action::ShowActivity => self.change_view(hwnd, View::Activity),
+            Action::ShowMcp => self.navigate(hwnd, View::McpMessages),
+            Action::ShowActivity => self.navigate(hwnd, View::Activity),
             Action::ClearAgents => {
                 // Live only. History is cleared from its own chip, so wiping
                 // the current list cannot take the record with it.
@@ -1586,7 +1583,7 @@ impl Ui {
                 }
                 self.agent_expanded.clear();
                 if self.shared.agent_history.lock().unwrap().is_empty() {
-                    self.change_view(hwnd, View::Main);
+                    self.navigate(hwnd, View::Main);
                 } else {
                     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
                 }
@@ -1617,7 +1614,7 @@ impl Ui {
             }
             Action::ClearMcp => {
                 self.mcp_messages.clear();
-                self.change_view(hwnd, View::Main);
+                self.navigate(hwnd, View::Main);
             }
             Action::CopyMcpCmd => {
                 copy_to_clipboard(hwnd, &mcp_connect_cmd());

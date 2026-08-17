@@ -258,7 +258,7 @@ it first once the SignPath secrets are set.
 ### Tests
 
 ```sh
-cargo test    # 109 tests, and they run on Linux too
+cargo test    # 114 tests, and they run on Linux too
 ```
 
 The parsing and bookkeeping layers — settings, alert rules, agent tracking,

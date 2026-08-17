@@ -124,6 +124,50 @@ pub fn cpu_pct(busy_delta: u64, total_delta: u64) -> f32 {
     ((busy_delta as f64 / total_delta as f64) * 100.0).clamp(0.0, 100.0) as f32
 }
 
+/// The trail of screens leading to the current one, which "back" walks out of.
+///
+/// Revisiting a screen already on the trail collapses back to it rather than
+/// stacking a second copy. Without that, two screens that can each open the
+/// other — a watched app and its connection list — end up pointing at each
+/// other, and back bounces between them forever. Collapsing means the trail
+/// can only shrink toward a screen it already holds, so back always makes
+/// progress and always terminates.
+pub struct NavTrail<T> {
+    items: Vec<T>,
+    cap: usize,
+}
+
+impl<T: Copy + PartialEq> NavTrail<T> {
+    pub fn new(cap: usize) -> Self {
+        NavTrail { items: Vec::new(), cap }
+    }
+
+    /// Moving forward from `current` to `next`.
+    pub fn advance(&mut self, current: T, next: T) {
+        if let Some(pos) = self.items.iter().position(|v| *v == next) {
+            self.items.truncate(pos);
+        } else {
+            self.items.push(current);
+            // A trail this long means someone is exploring, not lost; the
+            // oldest entry is the least useful thing to keep.
+            if self.items.len() > self.cap {
+                self.items.remove(0);
+            }
+        }
+    }
+
+    /// One step back, or None when there is nowhere further to go.
+    pub fn back(&mut self) -> Option<T> {
+        self.items.pop()
+    }
+
+    /// Only the tests care how deep the trail is; the panel just walks it.
+    #[cfg(test)]
+    pub fn depth(&self) -> usize {
+        self.items.len()
+    }
+}
+
 /// Escape a string for a JSON value (control characters, quotes, backslash).
 /// The app links no JSON crate on the writing side either: every response it
 /// builds has a fixed shape, so escaping is the only part that needs care.
@@ -424,5 +468,87 @@ mod tests {
             assert!(h >= last, "ctrl_h shrank going up to scale {}", scale);
             last = h;
         }
+    }
+
+    /// Stand-in for the panel's `View`, with only the screens that mattered.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Screen {
+        Main,
+        NetDrill,
+        Endpoints,
+        App,
+        Settings,
+    }
+
+    /// Walk back until there is nowhere left, and report the path taken.
+    /// Bounded so a trail that cannot terminate fails the test instead of
+    /// hanging it.
+    fn walk_back(trail: &mut NavTrail<Screen>) -> Vec<Screen> {
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            match trail.back() {
+                Some(v) => seen.push(v),
+                None => return seen,
+            }
+        }
+        panic!("back never reached the end: {:?}", seen);
+    }
+
+    #[test]
+    fn back_walks_out_the_way_it_came() {
+        let mut t = NavTrail::new(16);
+        t.advance(Screen::Main, Screen::NetDrill);
+        t.advance(Screen::NetDrill, Screen::Endpoints);
+        t.advance(Screen::Endpoints, Screen::App);
+        assert_eq!(
+            walk_back(&mut t),
+            vec![Screen::Endpoints, Screen::NetDrill, Screen::Main]
+        );
+    }
+
+    #[test]
+    fn an_app_and_its_endpoints_cannot_trap_back() {
+        // The reported bug: opening an app from the endpoint list and then
+        // its endpoints again left back bouncing between the two forever.
+        let mut t = NavTrail::new(16);
+        t.advance(Screen::Main, Screen::NetDrill);
+        t.advance(Screen::NetDrill, Screen::Endpoints);
+        t.advance(Screen::Endpoints, Screen::App);
+        // ...and back to the endpoints, filtered to that app.
+        t.advance(Screen::App, Screen::Endpoints);
+        // The second visit collapsed onto the first, so back still leads out.
+        assert_eq!(walk_back(&mut t), vec![Screen::NetDrill, Screen::Main]);
+    }
+
+    #[test]
+    fn bouncing_between_two_screens_never_deepens_the_trail() {
+        let mut t = NavTrail::new(16);
+        t.advance(Screen::Main, Screen::App);
+        let depth = t.depth();
+        for _ in 0..20 {
+            t.advance(Screen::App, Screen::Endpoints);
+            t.advance(Screen::Endpoints, Screen::App);
+        }
+        assert_eq!(t.depth(), depth, "a round trip must not grow the trail");
+        assert_eq!(walk_back(&mut t), vec![Screen::Main]);
+    }
+
+    #[test]
+    fn back_from_the_first_screen_has_nowhere_to_go() {
+        let mut t: NavTrail<Screen> = NavTrail::new(16);
+        assert_eq!(t.back(), None, "the caller falls back to the main view");
+    }
+
+    #[test]
+    fn a_long_trail_is_capped_but_still_walks_out() {
+        let mut t = NavTrail::new(3);
+        let mut prev = Screen::Main;
+        // Alternating so no entry collapses; only the cap can trim it.
+        for next in [Screen::NetDrill, Screen::Settings, Screen::NetDrill, Screen::Settings, Screen::NetDrill] {
+            t.advance(prev, next);
+            prev = next;
+        }
+        assert!(t.depth() <= 3, "depth {} exceeded the cap", t.depth());
+        walk_back(&mut t);
     }
 }
