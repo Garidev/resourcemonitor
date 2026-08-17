@@ -707,6 +707,36 @@ chart at once, without GDI+.
 
 ---
 
+### Ink contrast — a measured floor, not a judgement
+
+The first cut of this palette set `mute` by eye and it was reported as hard to
+read, correctly. Measured, it was **3.47:1 on the dark card** — under the 4.5:1
+AA floor, and `mute` is the *smallest* text in the product at the 10 px step, so
+it has no claim on the large-text exemption.
+
+The three ink steps are now solved for rather than picked, and each clears 4.5:1
+against **both** `card` and `bg`:
+
+| theme | `text` | `dim` | `mute` |
+|---|---:|---:|---:|
+| dark | 13.5 | 7.02 | 4.72 |
+| black | 17.0 | 7.03 | 4.68 |
+| light | 18.0 | 6.99 | 4.70 |
+
+Spacing the steps at roughly 13 / 7 / 4.7 keeps three legible ranks. Raising
+`mute` to the floor without also raising `dim` would have collapsed the two into
+each other.
+
+### The cue banner cannot be themed
+
+`EM_SETCUEBANNER` draws in `GetSysColor(COLOR_GRAYTEXT)` — a fixed mid grey.
+Against this app's dark field that measures **3.7:1**, and it cannot be fixed by
+changing the field: moving the background *toward* the grey lowers contrast, and
+the best any background can reach is about 4:1. So the placeholder is drawn by
+the app instead, in `mute`, from a `SetWindowLongPtrW` subclass on the EDIT that
+chains to the original proc and paints after it. The control's own text is never
+touched, so a hint can never be mistaken for a filter value.
+
 ## 6. Surfaces
 
 ### The elevation ladder

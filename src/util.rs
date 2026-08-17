@@ -29,14 +29,8 @@ pub const SP3: i32 = 8;
 /// The panel gutter, and the gap inside a card.
 pub const SP4: i32 = 12;
 /// Between rows of related controls.
-/// Part of the published scale; not yet consumed — see the sequencing table
-/// in `docs/design/ui-foundation.md` §9 for which step claims it.
-#[allow(dead_code)]
 pub const SP5: i32 = 16;
 /// Between sections.
-/// Part of the published scale; not yet consumed — see the sequencing table
-/// in `docs/design/ui-foundation.md` §9 for which step claims it.
-#[allow(dead_code)]
 pub const SP6: i32 = 24;
 /// Above a section heading that follows content.
 /// Part of the published scale; not yet consumed — see the sequencing table
@@ -66,6 +60,38 @@ pub const HEADER_H: i32 = 40;
 /// in `docs/design/ui-foundation.md` §9 for which step claims it.
 #[allow(dead_code)]
 pub const HEADER_STRIDE: i32 = 52;
+
+/// Render a process affinity mask as a human range list: `all cores`,
+/// `cores 0-7`, `cores 0-3, 8-11`.
+///
+/// Affinity is which cores a process is *allowed* on, which is the per-core
+/// question about a process that Windows will answer cheaply. It will not tell
+/// you which core a process is actually *on*: the only accurate source for that
+/// is ETW context-switch tracing, needing a second kernel session, a
+/// thread-to-process map kept from thread lifetime events, and thousands of
+/// events a second on a busy machine.
+pub fn affinity_label(proc_mask: u64, sys_mask: u64) -> String {
+    if proc_mask == sys_mask {
+        return "all cores".to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0u32;
+    while i < 64 {
+        if proc_mask >> i & 1 == 1 {
+            let start = i;
+            while i + 1 < 64 && proc_mask >> (i + 1) & 1 == 1 {
+                i += 1;
+            }
+            parts.push(if start == i { format!("{start}") } else { format!("{start}-{i}") });
+        }
+        i += 1;
+    }
+    if parts.is_empty() {
+        "no cores".to_string()
+    } else {
+        format!("cores {}", parts.join(", "))
+    }
+}
 
 /// Corner radius on cards, chips, input frames, chart plates and the widget
 /// strip. Nothing in the product is fully round: a pill chip at `CTRL_H = 24`
@@ -450,6 +476,18 @@ pub fn json_objects(arr: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affinity_label_reads_as_ranges() {
+        assert_eq!(affinity_label(0xff, 0xff), "all cores");
+        assert_eq!(affinity_label(0b0000_1111, 0xffff), "cores 0-3");
+        assert_eq!(affinity_label(0b1111_0000_1111, 0xffff), "cores 0-3, 8-11");
+        assert_eq!(affinity_label(0b0010_0001, 0xffff), "cores 0, 5");
+        // Stated, not blank: a process pinned to nothing is worth saying.
+        assert_eq!(affinity_label(0, 0xff), "no cores");
+        // A single core still reads as one number, not a degenerate range.
+        assert_eq!(affinity_label(1, 0xffff), "cores 0");
+    }
 
     #[test]
     fn nice_quantises_to_1_2_5_decades() {

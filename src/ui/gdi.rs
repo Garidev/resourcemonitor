@@ -43,6 +43,12 @@ pub struct Theme {
     pub text: u32,
     pub dim: u32,
     /// Third ink step, below `dim`: units, ticks, times, secondary figures.
+    ///
+    /// This is the smallest text in the product at the 10 px micro step, so it
+    /// is held to the same 4.5:1 floor as body text against **both** `card` and
+    /// `bg` — not the 3:1 a large-text exemption would allow. The first cut of
+    /// this palette sat at 3.47:1 on the dark card and was reported as hard to
+    /// read, which it was.
     pub mute: u32,
     pub danger: u32,
     pub warn: u32,
@@ -93,8 +99,8 @@ pub const THEMES: [Theme; 3] = [
         input_bg: rgb(14, 15, 18),
         input_border: rgb(62, 67, 76),
         text: rgb(232, 234, 237),
-        dim: rgb(144, 150, 160),
-        mute: rgb(110, 116, 126),
+        dim: rgb(166, 170, 180),
+        mute: rgb(134, 138, 148),
         danger: rgb(242, 85, 90),
         warn: rgb(232, 163, 58),
         good: rgb(70, 190, 113),
@@ -112,8 +118,8 @@ pub const THEMES: [Theme; 3] = [
         input_bg: rgb(6, 6, 7),
         input_border: rgb(52, 57, 65),
         text: rgb(237, 239, 242),
-        dim: rgb(140, 146, 155),
-        mute: rgb(106, 112, 121),
+        dim: rgb(151, 155, 165),
+        mute: rgb(120, 124, 134),
         danger: rgb(242, 85, 90),
         warn: rgb(232, 163, 58),
         good: rgb(70, 190, 113),
@@ -131,8 +137,8 @@ pub const THEMES: [Theme; 3] = [
         input_bg: rgb(255, 255, 255),
         input_border: rgb(195, 201, 210),
         text: rgb(20, 23, 28),
-        dim: rgb(92, 99, 110),
-        mute: rgb(118, 125, 136),
+        dim: rgb(78, 82, 92),
+        mute: rgb(104, 108, 118),
         danger: rgb(194, 38, 46),
         warn: rgb(154, 95, 0),
         good: rgb(26, 135, 49),
@@ -571,6 +577,172 @@ pub fn card(dc: HDC, r: &RECT, fill_c: u32, line_c: u32, radius: i32) {
         DeleteObject(edge as HGDIOBJ);
         DeleteObject(body as HGDIOBJ);
         DeleteObject(rgn as HGDIOBJ);
+    }
+}
+
+/// Chrome glyphs: navigation, window controls, and the destructive one.
+///
+/// These retire every word-as-button and every font glyph the panel used to
+/// lean on — `"settings"`, `"pin"`, `"top"`, `"pause"`, `"×"`, `"›"`, `"▾"`,
+/// `"◆"`, `"◇"`. A font glyph centres its *cell*, not its ink, so it never
+/// lines up with adjacent text; geometry always does.
+#[derive(Copy, Clone, PartialEq)]
+pub enum Icon {
+    Gear,
+    /// Close. Uses `dim`, `text` on hover — **never** `danger`, because
+    /// dismissing a window is not destructive.
+    Close,
+    /// Terminate. The destructive one, and the whole point of it is that it is
+    /// no longer the same mark as `Close`.
+    Trash,
+    Pin,
+    /// `Pin` rotated, for the pinned state.
+    Unpin,
+    OnTop,
+    Search,
+    Pause,
+    Play,
+    Check,
+    Grip,
+    /// Agent/status markers: filled for live, stroked for finished.
+    DotFilled,
+    DotHollow,
+}
+
+/// Chrome glyph on the same 16-unit grid as [`metric_icon`]. `surface` is the
+/// colour behind the glyph, needed only by `Gear` to punch its hub.
+pub fn icon(dc: HDC, cx: i32, cy: i32, size: i32, thickness: i32, color: u32, surface: u32, g: Icon) {
+    let u = size.max(8) as f32 / 16.0;
+    let p = |x: f32, y: f32| POINT { x: cx + (x * u).round() as i32, y: cy + (y * u).round() as i32 };
+    let un = |v: f32| (v * u).round() as i32;
+    let th = thickness.max(1);
+    unsafe {
+        let pen = CreatePen(PS_SOLID as i32, th, color);
+        let old_pen = SelectObject(dc, pen as HGDIOBJ);
+        let hollow = GetStockObject(NULL_BRUSH) as HGDIOBJ;
+        let solid = CreateSolidBrush(color);
+        let line = |pts: &[POINT]| Polyline(dc, pts.as_ptr(), pts.len() as i32);
+        let filled = |pts: &[POINT]| {
+            let ob = SelectObject(dc, solid as HGDIOBJ);
+            Polygon(dc, pts.as_ptr(), pts.len() as i32);
+            SelectObject(dc, ob);
+        };
+
+        match g {
+            Icon::Gear => {
+                // Six teeth, not eight: at 14 px an 8-tooth gear turns to mush.
+                let (ro, ri, hub) = (7.4f32, 5.4f32, 2.4f32);
+                let t_n = 6usize;
+                let pitch = std::f32::consts::TAU / t_n as f32;
+                let (half, gap) = (pitch * 0.21, pitch * 0.06);
+                let mut pts: Vec<POINT> = Vec::with_capacity(t_n * 4);
+                for k in 0..t_n {
+                    let a = k as f32 * pitch - std::f32::consts::FRAC_PI_2;
+                    for (r, ang) in [
+                        (ro, a - half),
+                        (ro, a + half),
+                        (ri, a + half + gap),
+                        (ri, a + pitch - half - gap),
+                    ] {
+                        pts.push(p(ang.cos() * r, ang.sin() * r));
+                    }
+                }
+                filled(&pts);
+                // Punch the hub in the surface colour: the equivalent of
+                // CombineRgn(RGN_DIFF) for two calls instead of four.
+                let hb = CreateSolidBrush(surface);
+                let hp = CreatePen(PS_SOLID as i32, 1, surface);
+                let ob = SelectObject(dc, hb as HGDIOBJ);
+                let op = SelectObject(dc, hp as HGDIOBJ);
+                let (a, b) = (p(-hub, -hub), p(hub, hub));
+                Ellipse(dc, a.x, a.y, b.x + 1, b.y + 1);
+                SelectObject(dc, ob);
+                SelectObject(dc, op);
+                DeleteObject(hb as HGDIOBJ);
+                DeleteObject(hp as HGDIOBJ);
+            }
+            Icon::Close => {
+                line(&[p(-4.5, -4.5), p(4.5, 4.5)]);
+                line(&[p(4.5, -4.5), p(-4.5, 4.5)]);
+            }
+            Icon::Trash => {
+                line(&[p(-5.0, -3.5), p(5.0, -3.5)]);
+                line(&[p(-2.0, -3.5), p(-2.0, -5.0), p(2.0, -5.0), p(2.0, -3.5)]);
+                line(&[p(-4.0, -3.5), p(-3.2, 5.5), p(3.2, 5.5), p(4.0, -3.5)]);
+                line(&[p(-1.4, -1.0), p(-1.4, 3.5)]);
+                line(&[p(1.4, -1.0), p(1.4, 3.5)]);
+            }
+            Icon::Pin | Icon::Unpin => {
+                // Unpin is the same pushpin rotated 35°, done by rotating the
+                // points rather than SetWorldTransform: cheaper, and there is
+                // no DC state to restore afterwards.
+                let a = if g == Icon::Unpin { 35f32.to_radians() } else { 0.0 };
+                let (sa, ca) = (a.sin(), a.cos());
+                let rp = |x: f32, y: f32| p(x * ca - y * sa, x * sa + y * ca);
+                let hr = 3.0;
+                let ob = SelectObject(dc, solid as HGDIOBJ);
+                let c = rp(0.0, -3.0);
+                Ellipse(dc, c.x - un(hr), c.y - un(hr), c.x + un(hr) + 1, c.y + un(hr) + 1);
+                SelectObject(dc, ob);
+                line(&[rp(0.0, 0.0), rp(0.0, 6.0)]);
+                line(&[rp(-4.0, -0.5), rp(4.0, -0.5)]);
+            }
+            Icon::OnTop => {
+                let (a, b) = (p(-6.0, -4.0), p(6.0, 5.0));
+                let ob = SelectObject(dc, hollow);
+                Rectangle(dc, a.x, a.y, b.x + 1, b.y + 1);
+                SelectObject(dc, ob);
+                let band = RECT {
+                    left: a.x,
+                    top: a.y,
+                    right: b.x + 1,
+                    bottom: a.y + un(2.0).max(1),
+                };
+                fill(dc, &band, color);
+                line(&[p(-3.0, -6.5), p(0.0, -8.5), p(3.0, -6.5)]);
+            }
+            Icon::Search => {
+                let (a, b) = (p(-5.0, -5.0), p(3.0, 3.0));
+                let ob = SelectObject(dc, hollow);
+                Ellipse(dc, a.x, a.y, b.x + 1, b.y + 1);
+                SelectObject(dc, ob);
+                line(&[p(2.0, 2.0), p(5.5, 5.5)]);
+            }
+            Icon::Pause => {
+                for x in [-3.0f32, 3.0] {
+                    let (a, b) = (p(x - 1.25, -5.0), p(x + 1.25, 5.0));
+                    let r = RECT { left: a.x, top: a.y, right: b.x + 1, bottom: b.y + 1 };
+                    fill(dc, &r, color);
+                }
+            }
+            Icon::Play => filled(&[p(-3.5, -5.0), p(5.0, 0.0), p(-3.5, 5.0)]),
+            Icon::Check => {
+                // A tick, not the smaller filled square the panel used — that
+                // is a radio button's idiom, not a checkbox's.
+                line(&[p(-3.5, 0.3), p(-1.0, 3.0), p(4.0, -3.2)]);
+            }
+            Icon::Grip => {
+                for y in [-2.0f32, 2.0] {
+                    let (a, b) = (p(-5.0, y - 0.5), p(5.0, y + 0.5));
+                    let r = RECT { left: a.x, top: a.y, right: b.x + 1, bottom: b.y + 1 };
+                    fill(dc, &r, color);
+                }
+            }
+            Icon::DotFilled | Icon::DotHollow => {
+                let r = 3.4f32;
+                let (a, b) = (p(-r, -r), p(r, r));
+                let ob = SelectObject(
+                    dc,
+                    if g == Icon::DotFilled { solid as HGDIOBJ } else { hollow },
+                );
+                Ellipse(dc, a.x, a.y, b.x + 1, b.y + 1);
+                SelectObject(dc, ob);
+            }
+        }
+
+        DeleteObject(solid as HGDIOBJ);
+        SelectObject(dc, old_pen);
+        DeleteObject(pen as HGDIOBJ);
     }
 }
 

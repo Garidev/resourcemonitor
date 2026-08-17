@@ -377,6 +377,23 @@ resets with the process, like everything else in `Ui`.
 
 ---
 
+## 10b. Per-core, and the question it cannot answer
+
+Each core cell carries a 60-sample ring and a 1 px peak tick, and hovering one
+names it: `core 5 · 42% now · 91% peak in 60s`. The grid stays otherwise
+unlabelled — at four to eight columns there is no room for sixteen numbers, and
+unlabelled rules would be decoration.
+
+**Per-core usage *per process* is not offered, and that is a decision.** Windows
+exposes process *affinity* cheaply and exactly — which cores a process is
+allowed on, shown in the process view — but not which core it is currently
+running on. The only accurate source for that is ETW context-switch tracing,
+which needs a second kernel session, a thread-to-process map maintained from
+thread lifetime events, and thousands of events a second on a busy machine. For
+a tool whose whole claim is that it is cheap to run, that is the wrong trade. If
+it is ever built it should be an opt-in mode with an explicit cost, not a
+default.
+
 ## 11. Colour rules for charts
 
 Translated from the `dataviz` method to this renderer:

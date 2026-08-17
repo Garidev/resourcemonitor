@@ -81,6 +81,27 @@ pub struct Changes {
 }
 
 /// Height of the strip at a given scale. The one place that ratio lives.
+/// Round the layered window to 6 px, so the strip stops being the only square
+/// thing on a Windows 11 taskbar. One call, and it has to be repeated after
+/// every resize because a window region is fixed in client pixels.
+fn round_corners(hwnd: HWND) {
+    unsafe {
+        let mut r: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut r) == 0 {
+            return;
+        }
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        // SetWindowRgn takes ownership of the region; it must not be deleted.
+        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 12, 12);
+        if !rgn.is_null() {
+            SetWindowRgn(hwnd, rgn, 1);
+        }
+    }
+}
+
 fn strip_height(scale: f32) -> i32 {
     (26.0 * scale) as i32
 }
@@ -193,7 +214,10 @@ pub fn create(x: i32, y: i32, dpi: f32, widget_scale: f32) -> HWND {
             wc.hInstance,
             std::ptr::null(),
         );
-        SetLayeredWindowAttributes(hwnd, 0, 235, LWA_ALPHA);
+        // 242 rather than 235: at 235 the taskbar showed through enough to
+        // muddy the accent labels, which are the only thing on the strip.
+        SetLayeredWindowAttributes(hwnd, 0, 242, LWA_ALPHA);
+        round_corners(hwnd);
         STATE.with(|s| s.borrow_mut().dpi = dpi);
         apply_scale(scale);
         hwnd
@@ -412,6 +436,7 @@ unsafe extern "system" fn widget_proc(
         // content is never invalidated as the drag resizes it, leaving the
         // previous frame's pixels behind as artifacts.
         WM_SIZE => {
+            round_corners(hwnd);
             InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }

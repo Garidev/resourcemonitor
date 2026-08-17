@@ -28,8 +28,10 @@ use crate::conns;
 use crate::rules;
 use crate::sampler::{ProcStat, Shared, Snapshot, WM_APP_NOTIFY, WM_APP_SNAPSHOT};
 use crate::util::{
-    format_bytes, format_pct, format_rate, Ceiling, NavTrail, Ring, Scale, CARD_METRIC, RADIUS,
-    ROW_LIST, ROW_METRIC, ROW_NAV, ROW_NAV_STRIDE, SP1, SP2, SP3, SP4,
+    affinity_label, format_bytes, format_pct, format_rate, Ceiling, NavTrail, Ring, Scale,
+    CARD_METRIC,
+    HEADER_STRIDE, RADIUS, ROW_LIST, ROW_METRIC, ROW_NAV, ROW_NAV_STRIDE, SP1, SP2, SP3, SP4,
+    SP5, SP6,
 };
 
 const IDM_EXIT: u32 = 100;
@@ -248,6 +250,10 @@ pub struct Ui {
     /// state. Press is new: the panel previously gave no feedback at all
     /// between hover and whatever the click did.
     pressed: bool,
+    /// One 60-sample ring per logical core. A core cell used to be a bare
+    /// snapshot bar: 32 cores of history is a few KB and it turns each cell
+    /// into a window, which is what makes a peak tick meaningful.
+    core_hist: Vec<Ring>,
     /// Sticky y-ceilings for the four rate charts. One `f32` each; see
     /// [`util::Ceiling`]. Only the rate metrics need them — percentages pin to
     /// 100 and FPS quantises off a 60 floor.
@@ -371,7 +377,6 @@ pub struct Ui {
     agent_expanded: std::collections::HashSet<u64>,
 }
 
-const EM_SETCUEBANNER: u32 = 0x1501;
 
 fn hhmm() -> String {
     let mut st: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
@@ -427,9 +432,83 @@ fn copy_to_clipboard(hwnd: HWND, text: &str) {
     }
 }
 
+// Placeholder text per EDIT handle, and the original window procedure we chain
+// to. Keyed on the handle because the hint changes with the view.
+thread_local! {
+    static HINTS: RefCell<HashMap<isize, String>> = RefCell::new(HashMap::new());
+    static EDIT_PROC: RefCell<WNDPROC> = const { RefCell::new(None) };
+}
+
+/// Set the placeholder a field shows while it is empty.
+///
+/// This deliberately does **not** use `EM_SETCUEBANNER`. The control draws a cue
+/// banner in `GetSysColor(COLOR_GRAYTEXT)`, which is a fixed mid grey we cannot
+/// restyle: measured against this app's dark field it reaches 3.7:1, and making
+/// the field lighter moves it *toward* the grey and makes it worse — the best
+/// any background can do is about 4:1, still under the 4.5:1 floor for text
+/// this size. So the hint is ours to draw, in `mute`, which clears the floor on
+/// every theme.
+///
+/// Drawn in a subclass rather than by putting placeholder text *in* the control:
+/// the control's text is never touched, so a hint can never be mistaken for a
+/// filter value.
 fn set_cue(edit: HWND, text: &str) {
-    let w = gdi::wide(text);
-    unsafe { SendMessageW(edit, EM_SETCUEBANNER, 1, w.as_ptr() as LPARAM) };
+    HINTS.with(|h| h.borrow_mut().insert(edit as isize, text.to_string()));
+    unsafe {
+        let prev = SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_hint_proc as isize);
+        if prev != 0 && prev != edit_hint_proc as isize {
+            EDIT_PROC.with(|p| {
+                let mut p = p.borrow_mut();
+                if p.is_none() {
+                    *p = std::mem::transmute::<isize, WNDPROC>(prev);
+                }
+            });
+        }
+        InvalidateRect(edit, std::ptr::null(), 1);
+    }
+}
+
+/// Chains to the EDIT's own procedure, then paints the hint over the empty
+/// field. `user32`'s `SetWindowLongPtrW` rather than comctl32's
+/// `SetWindowSubclass`, so this costs no new DLL import.
+unsafe extern "system" fn edit_hint_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let orig = EDIT_PROC.with(|p| *p.borrow());
+    let call = |h, m, w, l| match orig {
+        Some(_) => CallWindowProcW(orig, h, m, w, l),
+        None => DefWindowProcW(h, m, w, l),
+    };
+    if msg != WM_PAINT {
+        return call(hwnd, msg, wparam, lparam);
+    }
+    let ret = call(hwnd, msg, wparam, lparam);
+    if GetWindowTextLengthW(hwnd) != 0 {
+        return ret;
+    }
+    let hint = HINTS.with(|h| h.borrow().get(&(hwnd as isize)).cloned());
+    let Some(hint) = hint else { return ret };
+    if hint.is_empty() {
+        return ret;
+    }
+    // The font the control was given, so the hint sits on the same baseline and
+    // at the same size as whatever the user is about to type.
+    let font = SendMessageW(hwnd, WM_GETFONT, 0, 0) as windows_sys::Win32::Graphics::Gdi::HFONT;
+    let dc = windows_sys::Win32::Graphics::Gdi::GetDC(hwnd);
+    if !dc.is_null() {
+        let mut r: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut r);
+        if !font.is_null() {
+            let (asc, desc, _) = gdi::text_metrics(dc, font);
+            let y = ((r.bottom - r.top) - (asc + desc)) / 2;
+            gdi::text(dc, 1, y.max(0), font, gdi::t().mute, &hint);
+        }
+        windows_sys::Win32::Graphics::Gdi::ReleaseDC(hwnd, dc);
+    }
+    ret
 }
 
 thread_local! {
@@ -528,6 +607,7 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         hist_net: Ring::new(60),
         surf: None,
         pressed: false,
+        core_hist: Vec::new(),
         ceil_disk: Ceiling::default(),
         ceil_net: Ceiling::default(),
         ceil_watch_ram: Ceiling::default(),
@@ -918,6 +998,12 @@ impl Ui {
         // Advance the sticky rate ceilings exactly once per sample. Doing this
         // in the paint would decay them at the repaint rate, which hover alone
         // can drive to dozens of times a second.
+        if self.core_hist.len() != s.core_pcts.len() {
+            self.core_hist = (0..s.core_pcts.len()).map(|_| Ring::new(60)).collect();
+        }
+        for (r, pct) in self.core_hist.iter_mut().zip(s.core_pcts.iter()) {
+            r.push(*pct);
+        }
         self.ceil_disk.update(self.hist_disk.max());
         self.ceil_net.update(self.hist_net.max());
         // 0 when nothing is presenting, so the graph flatlines rather than
@@ -1134,7 +1220,7 @@ impl Ui {
         // main view will draw — a constant here left dead space per hidden
         // row. Drives are two lines each: 22 for the figures, 20 for the bar.
         let metrics = self.visible_metric_rows() as i32 * self.s(ROW_METRIC);
-        self.s(12 + 26 + 30 + 50 + 26) + metrics + drives * self.s(42) + temps + mcp + self.s(12)
+        self.s(12 + HEADER_STRIDE + 50 + 26) + metrics + drives * self.s(42) + temps + mcp + self.s(12)
     }
 
     fn outer_size(&self, hwnd: HWND) -> (i32, i32) {
@@ -2205,12 +2291,17 @@ impl Ui {
             ShowWindow(self.edit_path, SW_HIDE);
             match self.view {
                 View::Main => {
+                    // Must agree with the merged header in `draw_main`: the
+                    // field starts at the gutter and the text begins after the
+                    // magnifier, and its right edge stops short of the clear ×.
+                    let text_left = pad + self.s(SP3) + self.s(GLYPH) + self.s(SP2);
+                    let controls = self.header_controls_w();
                     SetWindowPos(
                         self.edit,
                         std::ptr::null_mut(),
-                        pad + self.s(64),
-                        pad + self.s(25) + self.s(3),
-                        rc.right - 2 * pad - self.s(68) - self.s(20),
+                        text_left,
+                        pad + self.s(3),
+                        rc.right - pad - controls - text_left - self.s(20),
                         self.ctrl_h() - 2 * self.s(3),
                         SWP_NOZORDER,
                     );
@@ -2222,9 +2313,15 @@ impl Ui {
                     SetWindowPos(
                         self.edit,
                         std::ptr::null_mut(),
-                        pad + self.s(48),
+                        pad + self.s(SP3) + self.s(GLYPH) + self.s(SP2),
                         self.filter_input_y(),
-                        rc.right - 2 * pad - self.s(52) - self.s(46),
+                        rc.right
+                            - 2 * pad
+                            - self.s(SP3)
+                            - self.s(GLYPH)
+                            - self.s(SP2)
+                            - self.s(20)
+                            - self.ctrl_h(),
                         self.s(18),
                         SWP_NOZORDER,
                     );
@@ -2395,47 +2492,122 @@ impl Ui {
     }
 
     /// Small text button; returns the next button's right edge.
-    fn button(&mut self, dc: HDC, right_edge: i32, y: i32, label: &str, active: bool, action: Action) -> i32 {
-        let w = gdi::text_width(dc, self.fonts.micro, label);
-        let x = right_edge - w;
-        let color = if active { gdi::acc().cpu } else { gdi::t().dim };
-        gdi::text(dc, x, y, self.fonts.micro, color, label);
-        let pad = self.s(6);
-        let hit = RECT {
-            left: x - pad,
-            top: y - pad,
-            right: right_edge + pad,
-            bottom: y + self.s(14) + pad,
-        };
-        self.hits.push((hit, action));
-        x - self.s(14)
+    /// A checkbox. Rounded frame, and when checked an accent fill carrying a
+    /// tick — the old "checked" state was a smaller filled square inside a
+    /// bigger one, which is a radio button's idiom, not a checkbox's.
+    fn check_box(&self, dc: HDC, r: &RECT, checked: bool) {
+        let fill_c = if checked { gdi::acc().cpu } else { gdi::t().input_bg };
+        let line_c = if checked { fill_c } else { gdi::t().input_border };
+        gdi::card(dc, r, fill_c, line_c, self.s(3));
+        if checked {
+            gdi::icon(
+                dc,
+                (r.left + r.right) / 2,
+                (r.top + r.bottom) / 2,
+                r.right - r.left,
+                self.s(2).max(1),
+                gdi::on(fill_c),
+                fill_c,
+                gdi::Icon::Check,
+            );
+        }
     }
 
-    /// Close affordance at the top right of the flyout. The panel no longer
-    /// closes when you click away, so this (or Esc) is how you dismiss it.
-    /// Sits on the same baseline as the text buttons beside it despite using
-    /// a larger font.
-    fn close_button(&mut self, dc: HDC, right_edge: i32, y: i32) -> i32 {
-        let w = gdi::text_width(dc, self.fonts.body, "×");
-        let x = right_edge - w;
-        let hit = RECT {
-            left: x - self.s(7),
-            top: y - self.s(6),
-            right: right_edge + self.s(6),
-            bottom: y + self.s(17),
-        };
-        let hot = self.hovered(&hit);
-        if hot {
-            gdi::fill(dc, &hit, gdi::t().card_hover);
-        }
-        let (sasc, _, _) = gdi::text_metrics(dc, self.fonts.micro);
-        let (nasc, _, _) = gdi::text_metrics(dc, self.fonts.body);
-        let baseline = y + sasc;
-        let color = if hot { gdi::rgb(230, 100, 100) } else { gdi::t().dim };
-        gdi::text(dc, x, baseline - nasc, self.fonts.body, color, "×");
-        self.hits.push((hit, Action::ClosePanel));
-        x - self.s(14)
+    /// The destructive mark. A trash glyph in `danger`, never the `×` that also
+    /// dismissed windows — the same mark for "close this" and "terminate this
+    /// process" was the one genuinely dangerous thing in the old icon set.
+    fn kill_glyph(&self, dc: HDC, x: i32, y: i32) {
+        let g = self.s(GLYPH);
+        gdi::icon(
+            dc,
+            x + g / 2,
+            y + g / 2 + self.s(SP1),
+            g,
+            self.s(1).max(1),
+            gdi::t().danger,
+            gdi::t().card,
+            gdi::Icon::Trash,
+        );
     }
+
+    /// The magnifier that sits inside a search or filter frame, in place of a
+    /// word label beside it.
+    fn search_glyph(&self, dc: HDC, frame: &RECT) {
+        gdi::icon(
+            dc,
+            frame.left + self.s(SP3) + self.s(GLYPH) / 2,
+            (frame.top + frame.bottom) / 2,
+            self.s(GLYPH),
+            self.s(1).max(1),
+            gdi::t().mute,
+            gdi::t().input_bg,
+            gdi::Icon::Search,
+        );
+    }
+
+    /// Total width the header's icon buttons occupy, including the gap between
+    /// each. One function so `draw_main` and `update_edit` cannot disagree about
+    /// where the search field has to stop — they are 1500 lines apart.
+    fn header_controls_w(&self) -> i32 {
+        // Always three: gear and pin, plus either close (flyout) or on-top
+        // (pinned) — never both, since a pinned window has a real title bar.
+        3 * (self.ctrl_h() + self.s(SP2))
+    }
+
+    /// A square icon button, `CTRL_H` on a side, laid out right-to-left.
+    /// Returns the right edge for the next button along.
+    ///
+    /// Replaces the word-buttons — `settings`, `pin`, `top`, `pause` — that used
+    /// to sit in the header. A row of words reads as prose and has to be
+    /// re-read; a row of glyphs is scanned once and learned.
+    fn icon_button(
+        &mut self,
+        dc: HDC,
+        right_edge: i32,
+        y: i32,
+        g: gdi::Icon,
+        active: bool,
+        action: Action,
+    ) -> i32 {
+        let h = self.ctrl_h();
+        let r = RECT { left: right_edge - h, top: y, right: right_edge, bottom: y + h };
+        let hot = self.hovered(&r);
+        let down = hot && self.pressed;
+        let ground = if down {
+            gdi::t().card_press
+        } else if hot {
+            gdi::t().card_hover
+        } else {
+            gdi::t().bg
+        };
+        if hot || active {
+            let fill_c = if active && !hot { gdi::t().card } else { ground };
+            gdi::card(dc, &r, fill_c, gdi::t().line, self.s(RADIUS));
+        }
+        // Close is not destructive, so it never goes red; the trash glyph is the
+        // only thing in the product that does.
+        let color = if active {
+            gdi::acc().cpu
+        } else if hot {
+            if g == gdi::Icon::Trash { gdi::t().danger } else { gdi::t().text }
+        } else {
+            gdi::t().dim
+        };
+        gdi::icon(
+            dc,
+            (r.left + r.right) / 2,
+            (r.top + r.bottom) / 2,
+            self.s(GLYPH),
+            self.s(1).max(1),
+            color,
+            ground,
+            g,
+        );
+        self.hits.push((r, action));
+        r.left - self.s(SP2)
+    }
+
+
 
     /// Filled pill button (for save/cancel and choice chips).
     fn chip(&mut self, dc: HDC, x: i32, y: i32, label: &str, active: bool, action: Action) -> i32 {
@@ -2486,35 +2658,34 @@ impl Ui {
         let mut y = pad;
         let s = self.snap.clone();
 
-        // --- header strip: buttons only (window title carries the name)
+        // --- header strip: search field and window controls on ONE row.
+        //
+        // These used to be two bands: a row of word-buttons, then a labelled
+        // input below it. Merging them reclaims a whole band, and dropping the
+        // "Find app" label gives its 60 px to the field — the magnifier inside
+        // the frame says what the box is for.
+        let pinned = self.cfg.pinned;
         let mut edge = rc.right - pad;
         // A pinned window has a real title-bar close button, so the in-panel
-        // × is only drawn for the flyout.
-        if !self.cfg.pinned {
-            edge = self.close_button(dc, edge, y);
+        // close is only drawn for the flyout.
+        if !pinned {
+            edge = self.icon_button(dc, edge, y, gdi::Icon::Close, false, Action::ClosePanel);
         }
-        edge = self.button(dc, edge, y, "settings", true, Action::OpenSettings);
+        edge = self.icon_button(dc, edge, y, gdi::Icon::Gear, false, Action::OpenSettings);
         // A flyout is always topmost (see insert_after), so the toggle only
         // means anything once the window is pinned in place.
-        if self.cfg.pinned {
+        if pinned {
             let on_top = self.cfg.on_top;
-            edge = self.button(dc, edge, y, "top", on_top, Action::ToggleTop);
+            edge = self.icon_button(dc, edge, y, gdi::Icon::OnTop, on_top, Action::ToggleTop);
         }
-        let pinned = self.cfg.pinned;
-        self.button(dc, edge, y, if pinned { "unpin" } else { "pin" }, pinned, Action::TogglePin);
-        y += self.s(26);
+        let pin_glyph = if pinned { gdi::Icon::Unpin } else { gdi::Icon::Pin };
+        edge = self.icon_button(dc, edge, y, pin_glyph, pinned, Action::TogglePin);
 
-        // --- find-app row: label + framed input (EDIT overlays the frame)
-        gdi::text(dc, pad, y + self.s(4), self.fonts.micro, gdi::t().dim, "Find app");
-        let frame = RECT {
-            left: pad + self.s(60),
-            top: pad + self.s(25),
-            right: rc.right - pad,
-            bottom: pad + self.s(25) + self.ctrl_h(),
-        };
+        let frame = RECT { left: pad, top: y, right: edge + self.s(SP2), bottom: y + self.ctrl_h() };
         gdi::input_frame(dc, &frame);
+        self.search_glyph(dc, &frame);
         self.clear_button(dc, &frame);
-        y += self.s(32);
+        y += self.s(HEADER_STRIDE);
 
         // --- app finder results replace the overview while searching
         if !self.filter.is_empty() {
@@ -3152,23 +3323,16 @@ impl Ui {
     /// Filled dot for live work, hollow for finished.
     fn agent_dot(&self, dc: HDC, ry: i32, color: u32, filled: bool) {
         let pad = self.s(12);
-        let dot = RECT {
-            left: pad + self.s(2),
-            top: ry + self.s(4),
-            right: pad + self.s(9),
-            bottom: ry + self.s(11),
-        };
-        gdi::fill(dc, &dot, color);
-        if !filled {
-            // Punch the middle back to the background.
-            let inner = RECT {
-                left: dot.left + self.s(2),
-                top: dot.top + self.s(2),
-                right: dot.right - self.s(2),
-                bottom: dot.bottom - self.s(2),
-            };
-            gdi::fill(dc, &inner, gdi::t().bg);
-        }
+        gdi::icon(
+            dc,
+            pad + self.s(6),
+            ry + self.s(SP3),
+            self.s(GLYPH),
+            self.s(2).max(1),
+            color,
+            gdi::t().bg,
+            if filled { gdi::Icon::DotFilled } else { gdi::Icon::DotHollow },
+        );
     }
 
     fn draw_mcp_messages(&mut self, dc: HDC, rc: &RECT) {
@@ -3433,31 +3597,49 @@ impl Ui {
 
         // Filter row: label + framed input + pause toggle. The EDIT control is
         // positioned in update_edit at (pad+44, filter_input_y()).
-        gdi::text(dc, pad, y + self.s(5), self.fonts.micro, gdi::t().dim, "Filter");
+        // No "Filter" label: it was 10 px of low-contrast word doing a job the
+        // magnifier inside the frame does without costing any field width.
         let top = self.filter_input_y() - self.s(3);
         let btn = self.s(26);
         let frame = RECT {
-            left: pad + self.s(44),
+            left: pad,
             top,
             right: rc.right - pad - btn,
             bottom: top + self.ctrl_h(),
         };
         gdi::input_frame(dc, &frame);
+        self.search_glyph(dc, &frame);
         self.clear_button(dc, &frame);
         // Pause / resume toggle at the far right of the filter row. Its hit is
         // inserted at the front so no other rect can swallow the click.
-        let label = if self.paused { "resume" } else { "pause" };
-        let lw = gdi::text_width(dc, self.fonts.micro, label);
+        // Paused shows the play glyph — the button says what it will do next,
+        // not what state it is in. The accent ground carries the state.
         let pbtn = RECT {
-            left: rc.right - pad - lw - self.s(14),
+            left: rc.right - pad - self.ctrl_h(),
             top,
             right: rc.right - pad,
-            bottom: top + self.s(24),
+            bottom: top + self.ctrl_h(),
         };
         let hot = self.hovered(&pbtn);
-        gdi::fill(dc, &pbtn, if self.paused || hot { gdi::acc().fps } else { gdi::t().card });
-        let gcol = if self.paused || hot { gdi::on(gdi::acc().fps) } else { gdi::t().text };
-        gdi::text(dc, pbtn.left + self.s(7), top + self.s(4), self.fonts.micro, gcol, label);
+        let ground = if self.paused {
+            gdi::acc().fps
+        } else if hot {
+            gdi::t().card_hover
+        } else {
+            gdi::t().card
+        };
+        gdi::card(dc, &pbtn, ground, gdi::t().line, self.s(RADIUS));
+        let gcol = if self.paused { gdi::on(ground) } else { gdi::t().dim };
+        gdi::icon(
+            dc,
+            (pbtn.left + pbtn.right) / 2,
+            (pbtn.top + pbtn.bottom) / 2,
+            self.s(GLYPH),
+            self.s(1).max(1),
+            gcol,
+            ground,
+            if self.paused { gdi::Icon::Play } else { gdi::Icon::Pause },
+        );
         self.hits.insert(0, (pbtn, Action::TogglePause));
         y += self.s(32);
         if self.paused {
@@ -3468,21 +3650,60 @@ impl Ui {
         // Per-core grid at the top of the CPU drill-down.
         if metric == Metric::Cpu && !snap.core_pcts.is_empty() {
             let cores = snap.core_pcts.clone();
-            gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, &format!("CPU CORES ({})", cores.len()));
-            y += self.s(16);
+            gdi::text_t(
+                dc,
+                pad,
+                y,
+                self.fonts.label,
+                self.s(gdi::TRACK_LABEL),
+                gdi::t().mute,
+                &format!("CPU CORES · {}", cores.len()),
+            );
+            y += self.s(SP5);
             let cols: i32 = if cores.len() <= 8 { 2 } else if cores.len() <= 32 { 4 } else { 8 };
-            let gap = self.s(6);
+            let gap = self.s(SP3);
             let bar_w = (rc.right - rc.left - 2 * pad - (cols - 1) * gap) / cols;
+            let mut readout: Option<String> = None;
             for (i, pct) in cores.iter().enumerate() {
                 let col = (i as i32) % cols;
                 let row_i = (i as i32) / cols;
                 let bx = pad + col * (bar_w + gap);
-                let by = y + row_i * self.s(12);
-                let r = RECT { left: bx, top: by, right: bx + bar_w, bottom: by + self.s(8) };
+                let by = y + row_i * self.s(SP4);
+                let r = RECT { left: bx, top: by, right: bx + bar_w, bottom: by + self.s(SP3) };
                 gdi::bar(dc, &r, pct / 100.0, gdi::acc().cpu);
+                // One pixel per core that turns a snapshot into a window.
+                let peak = self.core_hist.get(i).map(|h| h.max()).unwrap_or(0.0);
+                if peak > 0.5 {
+                    let px = r.left + (((r.right - r.left) as f32) * (peak / 100.0).min(1.0)) as i32;
+                    let tick = RECT {
+                        left: px.min(r.right - 1),
+                        top: r.top,
+                        right: (px + 1).min(r.right),
+                        bottom: r.bottom,
+                    };
+                    gdi::fill(dc, &tick, gdi::t().text);
+                }
+                // Hover names the core. The grid carries no per-cell labels
+                // otherwise: at four to eight columns there is no room for
+                // sixteen numbers, and unlabelled rules would be decoration.
+                let hit = RECT { left: r.left, top: r.top - self.s(SP1), right: r.right, bottom: r.bottom + self.s(SP1) };
+                if self.hovered(&hit) {
+                    readout =
+                        Some(format!("core {} · {:.0}% now · {:.0}% peak in 60s", i, pct, peak));
+                }
             }
             let rows_n = (cores.len() as i32 + cols - 1) / cols;
-            y += rows_n * self.s(12) + self.s(10);
+            y += rows_n * self.s(SP4) + self.s(SP1);
+            gdi::text_t(
+                dc,
+                pad,
+                y,
+                self.fonts.micro,
+                self.s(gdi::TRACK_MICRO),
+                gdi::t().mute,
+                readout.as_deref().unwrap_or("hover a core for its number and peak"),
+            );
+            y += self.s(SP5);
         }
 
         if metric == Metric::Net && !snap.etw_ok {
@@ -3539,7 +3760,7 @@ impl Ui {
             let vx = kx - self.s(10) - vw;
             gdi::text_fit(dc, pad + self.s(4), ry, vx - self.s(8), &name_fonts, gdi::t().text, name);
             gdi::text(dc, vx, ry, self.fonts.value_sm, gdi::t().text, &vs);
-            gdi::text(dc, kx, ry, self.fonts.body, gdi::rgb(220, 90, 90), "×");
+            self.kill_glyph(dc, kx, ry);
             let name_hit = RECT {
                 left: pad,
                 top: (ry - self.s(2)).max(list_top),
@@ -3629,7 +3850,8 @@ impl Ui {
 
         // Filter row, same geometry as a drill-down's but with no pause
         // toggle: the list is already only as fast as the sweep.
-        gdi::text(dc, pad, y + self.s(5), self.fonts.micro, gdi::t().dim, "Filter");
+        // No "Filter" label: it was 10 px of low-contrast word doing a job the
+        // magnifier inside the frame does without costing any field width.
         let top = self.filter_input_y() - self.s(3);
         let frame = RECT {
             left: pad + self.s(44),
@@ -3794,13 +4016,32 @@ impl Ui {
         );
 
         let count = self.snap.procs.iter().filter(|p| p.name == name).count();
-        let status = if count == 0 {
+        let mut status = if count == 0 {
             "Not running".to_string()
         } else {
             format!("{} running", count)
         };
-        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, &status);
-        y += self.s(24);
+        // Which cores this app is allowed on. Cheap and exact, and the useful
+        // half of the per-core question — see `util::affinity_label` for why the
+        // other half (which core it is *on*) is not answered here.
+        if let Some(pid) = self.snap.procs.iter().find(|p| p.name == name).map(|p| p.pid) {
+            if let Some((m, sys)) = crate::procinfo::affinity(pid) {
+                if m != sys {
+                    status.push_str(" · ");
+                    status.push_str(&affinity_label(m, sys));
+                }
+            }
+        }
+        gdi::text_t(
+            dc,
+            pad,
+            y,
+            self.fonts.micro,
+            self.s(gdi::TRACK_MICRO),
+            gdi::t().mute,
+            &status,
+        );
+        y += self.s(SP6);
 
         let a = watch_sums(&self.snap.procs, &name);
         let fps = watch_fps(&self.snap, &name);
@@ -4018,7 +4259,7 @@ impl Ui {
                     let vx = kx - self.s(10) - vw;
                     gdi::text_fit(dc, pad + self.s(6), ry, vx - self.s(6), &[self.fonts.micro], gdi::t().text, &title);
                     gdi::text(dc, vx, ry, self.fonts.micro, accent_for(metric), &vs);
-                    gdi::text(dc, kx, ry, self.fonts.body, gdi::rgb(220, 90, 90), "×");
+                    self.kill_glyph(dc, kx, ry);
                     let kill_hit = RECT {
                         left: kx - self.s(6),
                         top: (ry - self.s(2)).max(list_top),
@@ -4041,7 +4282,16 @@ impl Ui {
         }
         let cx = frame.right - self.s(14);
         let cy = (frame.top + frame.bottom) / 2 - self.s(8);
-        gdi::text(dc, cx, cy, self.fonts.body, gdi::t().dim, "×");
+        gdi::icon(
+            dc,
+            cx + self.s(5),
+            cy + self.s(7),
+            self.s(11),
+            self.s(1).max(1),
+            gdi::t().dim,
+            gdi::t().input_bg,
+            gdi::Icon::Close,
+        );
         let hit = RECT {
             left: frame.right - self.s(24),
             top: frame.top,
@@ -4652,16 +4902,7 @@ impl Ui {
             right: pad + self.s(18),
             bottom: y + self.s(16),
         };
-        gdi::fill(dc, &box_r, gdi::t().track);
-        if checked {
-            let inner = RECT {
-                left: box_r.left + self.s(3),
-                top: box_r.top + self.s(3),
-                right: box_r.right - self.s(3),
-                bottom: box_r.bottom - self.s(3),
-            };
-            gdi::fill(dc, &inner, gdi::acc().cpu);
-        }
+        self.check_box(dc, &box_r, checked);
         let del_x = rc.right - pad - self.s(18);
         // Delete hit is pushed first so the × is not swallowed by the row.
         let del_hit = RECT { left: del_x - self.s(6), top: y - self.s(2), right: rc.right - pad + self.s(4), bottom: y + self.s(20) };
@@ -4670,7 +4911,7 @@ impl Ui {
         self.hits.push((toggle_hit, toggle));
         let color = if checked { gdi::t().text } else { gdi::t().dim };
         gdi::text_fit(dc, pad + self.s(26), y + self.s(1), del_x - self.s(8), &[self.fonts.micro], color, label);
-        gdi::text(dc, del_x, y, self.fonts.body, gdi::rgb(220, 90, 90), "×");
+        self.kill_glyph(dc, del_x, y);
         y + self.s(24)
     }
 
@@ -4704,13 +4945,19 @@ impl Ui {
                 }
             }
 
-            // Drag handle: three bars, the conventional grip.
+            // Drag handle. Two bars rather than three: at this size the third
+            // reads as noise, and two still say "grab me".
             let grip_x = pad + self.s(4);
-            for b in 0..3 {
-                let by = ry + self.s(4) + b * self.s(4);
-                let bar = RECT { left: grip_x, top: by, right: grip_x + self.s(10), bottom: by + self.s(2) };
-                gdi::fill(dc, &bar, if dragging { gdi::acc().cpu } else { gdi::t().dim });
-            }
+            gdi::icon(
+                dc,
+                grip_x + self.s(GLYPH) / 2,
+                ry + self.s(SP3) + self.s(SP1),
+                self.s(GLYPH),
+                self.s(1).max(1),
+                if dragging { gdi::acc().cpu } else { gdi::t().dim },
+                gdi::t().bg,
+                gdi::Icon::Grip,
+            );
             let grip_hit = RECT { left: pad, top: ry - self.s(2), right: grip_x + self.s(16), bottom: ry + self.s(20) };
             self.hits.push((grip_hit, Action::MetricDragStart(i)));
 
@@ -4720,16 +4967,7 @@ impl Ui {
                 right: grip_x + self.s(36),
                 bottom: ry + self.s(16),
             };
-            gdi::fill(dc, &box_r, gdi::t().track);
-            if *visible {
-                let inner = RECT {
-                    left: box_r.left + self.s(3),
-                    top: box_r.top + self.s(3),
-                    right: box_r.right - self.s(3),
-                    bottom: box_r.bottom - self.s(3),
-                };
-                gdi::fill(dc, &inner, gdi::acc().cpu);
-            }
+            self.check_box(dc, &box_r, *visible);
             // Mixed case here, not the row's uppercase: this is a settings list
             // of names, not the metric's identity band.
             let (label, accent, _) = metric_label(name);
@@ -4758,16 +4996,7 @@ impl Ui {
             right: pad + self.s(18),
             bottom: y + self.s(16),
         };
-        gdi::fill(dc, &box_r, gdi::t().track);
-        if checked {
-            let inner = RECT {
-                left: box_r.left + self.s(3),
-                top: box_r.top + self.s(3),
-                right: box_r.right - self.s(3),
-                bottom: box_r.bottom - self.s(3),
-            };
-            gdi::fill(dc, &inner, gdi::acc().cpu);
-        }
+        self.check_box(dc, &box_r, checked);
         gdi::text(dc, pad + self.s(26), y, self.fonts.body, gdi::t().text, label);
         let hit = RECT { left: pad, top: y - self.s(2), right: rc.right - pad, bottom: y + self.s(20) };
         self.hits.push((hit, action));

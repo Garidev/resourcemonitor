@@ -162,3 +162,33 @@ mod tests {
         assert_eq!(role_from_cmdline(""), "");
     }
 }
+
+/// Which logical cores a process is *allowed* to run on, as a bitmask, plus the
+/// system's own mask for comparison. `None` if the process is gone or refuses
+/// the query.
+///
+/// This is affinity, not occupancy — it answers "which cores can this app use",
+/// which is the question worth asking about a pinned or restricted workload.
+/// Windows does not expose per-core *usage* per process at any reasonable cost:
+/// the only accurate source is ETW context-switch tracing, which means a second
+/// kernel session, a thread-to-process map maintained from thread lifetime
+/// events, and thousands of events a second on a busy machine. That is a
+/// deliberate non-goal here, not an oversight.
+pub fn affinity(pid: u32) -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::Threading::GetProcessAffinityMask;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut proc_mask: usize = 0;
+        let mut sys_mask: usize = 0;
+        let ok = GetProcessAffinityMask(h, &mut proc_mask, &mut sys_mask);
+        CloseHandle(h);
+        if ok == 0 || sys_mask == 0 {
+            return None;
+        }
+        Some((proc_mask as u64, sys_mask as u64))
+    }
+}
+
