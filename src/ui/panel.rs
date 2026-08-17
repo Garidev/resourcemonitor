@@ -30,7 +30,7 @@ use crate::sampler::{ProcStat, Shared, Snapshot, WM_APP_NOTIFY, WM_APP_SNAPSHOT}
 use crate::util::{
     affinity_label, format_bytes, format_pct, format_rate, Ceiling, NavTrail, Ring, Scale,
     CARD_METRIC,
-    HEADER_STRIDE, RADIUS, ROW_LIST, ROW_METRIC, ROW_NAV, ROW_NAV_STRIDE, SP1, SP2, SP3, SP4,
+    HEADER_STRIDE, RADIUS, ROW_LIST, ROW_METRIC, SPARK_W, ROW_NAV, ROW_NAV_STRIDE, SP1, SP2, SP3, SP4,
     SP5, SP6,
 };
 
@@ -250,6 +250,19 @@ pub struct Ui {
     /// state. Press is new: the panel previously gave no feedback at all
     /// between hover and whatever the click did.
     pressed: bool,
+    /// The live hover cross-fade: the rect being left, the rect being entered,
+    /// and progress from 0 to 1. Either rect may be empty, meaning the cursor
+    /// came from or went to nothing.
+    ///
+    /// The only motion in the product the user actually feels. Snapping between
+    /// `card` and `card_hover` across a 15 % lightness step is what made the
+    /// panel read as a form rather than an instrument.
+    fade: Option<(RECT, RECT, f32)>,
+    /// Whether the fade timer is currently live. A timer that outlives its
+    /// transition would repaint forever, which in a resource monitor is the
+    /// worst bug available — so it is created in exactly one place, killed the
+    /// moment progress completes, and killed again when the mouse leaves.
+    fade_timer: bool,
     /// One 60-sample ring per logical core. A core cell used to be a bare
     /// snapshot bar: 32 cores of history is a few KB and it turns each cell
     /// into a window, which is what makes a peak tick meaningful.
@@ -607,6 +620,8 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         hist_net: Ring::new(60),
         surf: None,
         pressed: false,
+        fade: None,
+        fade_timer: false,
         core_hist: Vec::new(),
         ceil_disk: Ceiling::default(),
         ceil_net: Ceiling::default(),
@@ -797,6 +812,21 @@ impl Ui {
                 // While dragging a metric the insertion line follows the
                 // cursor, so every move needs a repaint, not just those that
                 // change which control is hovered.
+                if before != after {
+                    let rect_of = |i: Option<usize>| {
+                        i.and_then(|i| self.hits.get(i)).map(|h| h.0).unwrap_or(RECT {
+                            left: 0,
+                            top: 0,
+                            right: 0,
+                            bottom: 0,
+                        })
+                    };
+                    self.fade = Some((rect_of(before), rect_of(after), 0.0));
+                    if !self.fade_timer {
+                        unsafe { SetTimer(hwnd, ID_FADE, FADE_MS, None) };
+                        self.fade_timer = true;
+                    }
+                }
                 if before != after || self.metric_drag.is_some() {
                     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
                 }
@@ -817,9 +847,30 @@ impl Ui {
                 }
                 None
             }
+            WM_TIMER if wparam == ID_FADE => {
+                let done = match &mut self.fade {
+                    Some((_, _, t)) => {
+                        *t += FADE_MS as f32 / FADE_TOTAL_MS;
+                        *t >= 1.0
+                    }
+                    None => true,
+                };
+                if done {
+                    self.fade = None;
+                    unsafe { KillTimer(hwnd, ID_FADE) };
+                    self.fade_timer = false;
+                }
+                unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+                Some(0)
+            }
             WM_MOUSELEAVE => {
                 self.mouse_tracking = false;
                 self.pressed = false;
+                self.fade = None;
+                if self.fade_timer {
+                    unsafe { KillTimer(hwnd, ID_FADE) };
+                    self.fade_timer = false;
+                }
                 if self.hover_pos.take().is_some() {
                     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
                 }
@@ -1438,16 +1489,43 @@ impl Ui {
     fn card(&self, dc: HDC, r: &RECT) {
         let hot = self.hovered(r);
         let down = hot && self.pressed;
+        let (base, hover) = (gdi::t().card, gdi::t().card_hover);
         let fill = if down {
             gdi::t().card_press
-        } else if hot {
-            gdi::t().card_hover
         } else {
-            gdi::t().card
+            match self.fade_for(r) {
+                // ease_out, so the fill arrives quickly and settles.
+                Some((from_hot, t)) => {
+                    let e = 1.0 - (1.0 - t) * (1.0 - t);
+                    if from_hot {
+                        gdi::mix(hover, base, e)
+                    } else {
+                        gdi::mix(base, hover, e)
+                    }
+                }
+                None if hot => hover,
+                None => base,
+            }
         };
         let line =
             if hot { gdi::mix(gdi::t().line, gdi::t().text, 0.14) } else { gdi::t().line };
         gdi::card(dc, r, fill, line, self.s(RADIUS));
+    }
+
+    /// If `r` is one end of the live cross-fade, whether it is the end being
+    /// *left* and how far along the transition is.
+    fn fade_for(&self, r: &RECT) -> Option<(bool, f32)> {
+        let (from, to, t) = self.fade?;
+        let same = |a: &RECT, b: &RECT| {
+            a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
+        };
+        if same(r, &to) {
+            Some((false, t))
+        } else if same(r, &from) {
+            Some((true, t))
+        } else {
+            None
+        }
     }
 
     /// Metric glyph plus its name, both in the metric's accent, centred on the
@@ -2551,7 +2629,10 @@ impl Ui {
     fn header_controls_w(&self) -> i32 {
         // Always three: gear and pin, plus either close (flyout) or on-top
         // (pinned) — never both, since a pinned window has a real title bar.
-        3 * (self.ctrl_h() + self.s(SP2))
+        // Plus the separating rule and the air either side of it: without that,
+        // the pin sits hard against the search field and reads as belonging to
+        // it, as though it pinned the search.
+        3 * self.ctrl_h() + 2 * self.s(SP2) + 2 * self.s(SP4) + 1
     }
 
     /// A square icon button, `CTRL_H` on a side, laid out right-to-left.
@@ -2597,8 +2678,8 @@ impl Ui {
             dc,
             (r.left + r.right) / 2,
             (r.top + r.bottom) / 2,
-            self.s(GLYPH),
-            self.s(1).max(1),
+            self.s(CHROME_GLYPH),
+            self.s(1).max(1) + 1,
             color,
             ground,
             g,
@@ -2681,7 +2762,20 @@ impl Ui {
         let pin_glyph = if pinned { gdi::Icon::Unpin } else { gdi::Icon::Pin };
         edge = self.icon_button(dc, edge, y, pin_glyph, pinned, Action::TogglePin);
 
-        let frame = RECT { left: pad, top: y, right: edge + self.s(SP2), bottom: y + self.ctrl_h() };
+        // A rule between the controls and the field. Without it the pin sits
+        // hard against the search box and proximity groups them, so it reads as
+        // pinning the search rather than the window.
+        let controls_left = edge + self.s(SP2);
+        let div_x = controls_left - self.s(SP4);
+        let div = RECT {
+            left: div_x,
+            top: y + self.s(SP2),
+            right: div_x + 1,
+            bottom: y + self.ctrl_h() - self.s(SP2),
+        };
+        gdi::fill(dc, &div, gdi::t().line);
+        let frame =
+            RECT { left: pad, top: y, right: div_x - self.s(SP4), bottom: y + self.ctrl_h() };
         gdi::input_frame(dc, &frame);
         self.search_glyph(dc, &frame);
         self.clear_button(dc, &frame);
@@ -2836,10 +2930,10 @@ impl Ui {
             self.card(dc, &row);
             let name_right = self.metric_name(dc, &row, accent, glyph, label);
             let spark = RECT {
-                left: row.right - self.s(120),
+                left: row.right - self.s(SPARK_W),
                 top: y + self.s(SP3),
                 right: row.right - self.s(SP4),
-                bottom: y + self.s(40),
+                bottom: y + self.s(44),
             };
             self.draw_figures(dc, &row, name_right, spark.left - self.s(SP3), figs);
             gdi::chart(
@@ -2851,6 +2945,8 @@ impl Ui {
                 accent,
                 gdi::ChartSize::Row,
                 self.scale,
+                None,
+                None,
             );
             self.hits.push((row, action));
             y += self.s(ROW_METRIC);
@@ -3523,6 +3619,139 @@ impl Ui {
         self.s(40 + 10)
     }
 
+    /// Height of the drill-down's hero plate, or 0 for the metrics that have no
+    /// history worth plotting large.
+    fn hero_h(&self) -> i32 {
+        self.s(HERO_H + SP4)
+    }
+
+    /// The ring, accent and scale behind a metric's hero chart.
+    fn hero_series(&self, m: Metric) -> (&Ring, u32, Scale, &'static str) {
+        match m {
+            Metric::Cpu => (&self.hist_cpu, gdi::acc().cpu, Scale::Percent, "Processor"),
+            Metric::Ram => (&self.hist_mem, gdi::acc().ram, Scale::Percent, "Memory"),
+            Metric::Gpu => (&self.hist_gpu, gdi::acc().gpu, Scale::Percent, "Graphics"),
+            Metric::Disk => (&self.hist_disk, gdi::acc().disk, Scale::Rate, "Disk"),
+            Metric::Net => (&self.hist_net, gdi::acc().net, Scale::Rate, "Network"),
+            Metric::Audio => (&self.hist_audio, gdi::acc().audio, Scale::Percent, "Sound"),
+        }
+    }
+
+    /// The hero chart: one plate carrying the metric's name, its current value
+    /// at the display step, the window, the ceiling, a peak marker and — on
+    /// hover — the sample under the cursor with its age.
+    ///
+    /// The age is relative on purpose. `23s ago` answers the question a monitor
+    /// is asked; `14:22:07` does not.
+    fn draw_hero(&mut self, dc: HDC, rc: &RECT, y: i32, m: Metric) -> i32 {
+        let pad = self.s(SP4);
+        let plate = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + self.s(HERO_H) };
+        gdi::card(dc, &plate, gdi::t().card, gdi::t().line, self.s(RADIUS));
+
+        let (ring, accent, scale, kind) = self.hero_series(m);
+        let held = ring.iter().count();
+        let cap = ring.capacity();
+        let sticky = if m == Metric::Disk { &self.ceil_disk } else { &self.ceil_net };
+        let ceiling = scale.ceiling(ring.max(), sticky);
+        let latest = ring.iter().last().unwrap_or(0.0);
+
+        let plot = RECT {
+            left: plate.left + self.s(SP4),
+            top: plate.top + self.s(44),
+            right: plate.right - self.s(SP4),
+            bottom: plate.top + self.s(44) + self.s(HERO_PLOT_H),
+        };
+
+        // Which sample the cursor is over, if any. `hover_pos` is already
+        // tracked and already forces a repaint on change, so this costs nothing
+        // new to drive.
+        let hit = self
+            .hover_pos
+            .filter(|(_, hy)| *hy >= plot.top && *hy < plot.bottom)
+            .and_then(|(hx, _)| gdi::chart_hit(&plot, cap, held, hx));
+        let shown = hit.and_then(|i| ring.iter().nth(i)).unwrap_or(latest);
+
+        let interval = self.cfg.interval_ms.max(1);
+        let age = match hit {
+            Some(i) => {
+                let back = held.saturating_sub(1).saturating_sub(i) as u32;
+                if back == 0 { "now".to_string() } else { format!("{}s ago", back * interval / 1000) }
+            }
+            None => "now".to_string(),
+        };
+
+        gdi::text_t(
+            dc,
+            plate.left + self.s(SP4),
+            plate.top + self.s(SP3),
+            self.fonts.label,
+            self.s(gdi::TRACK_LABEL),
+            accent,
+            &kind.to_uppercase(),
+        );
+        let vs = match scale {
+            Scale::Percent => format_pct(shown),
+            _ => format_rate(shown as u64),
+        };
+        gdi::text(
+            dc,
+            plate.left + self.s(SP4),
+            plate.top + self.s(SP5) + self.s(SP2),
+            self.fonts.display,
+            gdi::t().text,
+            &vs,
+        );
+        gdi::text_right_t(
+            dc,
+            plate.right - self.s(SP4),
+            plate.top + self.s(SP3),
+            self.fonts.micro,
+            self.s(gdi::TRACK_MICRO),
+            gdi::t().mute,
+            &age,
+        );
+
+        gdi::chart(
+            dc,
+            self.surf.as_ref(),
+            &plot,
+            ring,
+            ceiling,
+            accent,
+            gdi::ChartSize::Hero,
+            self.scale,
+            hit,
+            Some(self.fonts.micro),
+        );
+
+        // Window and ceiling labels. The window is derived, not hardcoded —
+        // this is the first time the panel says what its own graphs cover.
+        let secs = cap as u32 * interval / 1000;
+        gdi::text_t(
+            dc,
+            plot.left,
+            plot.bottom + self.s(SP1),
+            self.fonts.micro,
+            self.s(gdi::TRACK_MICRO),
+            gdi::t().mute,
+            &format!("{}s", secs),
+        );
+        let ceil_label = match scale {
+            Scale::Percent => "100%".to_string(),
+            _ => format_rate(ceiling as u64),
+        };
+        gdi::text_right_t(
+            dc,
+            plot.right,
+            plot.bottom + self.s(SP1),
+            self.fonts.micro,
+            self.s(gdi::TRACK_MICRO),
+            gdi::t().dim,
+            &ceil_label,
+        );
+        y + self.hero_h()
+    }
+
     /// Height of a nav row, and the stride to the next thing below it.
     fn nav_row_h(&self) -> i32 {
         self.s(ROW_NAV)
@@ -3565,7 +3794,8 @@ impl Ui {
         } else {
             0
         };
-        self.s(12) + self.header_height() + self.s(3) + nav
+        let hero = if matches!(self.view, View::Drill(_)) { self.hero_h() } else { 0 };
+        self.s(12) + self.header_height() + hero + self.s(3) + nav
     }
 
     fn draw_drill(&mut self, dc: HDC, rc: &RECT, metric: Metric) {
@@ -3587,6 +3817,8 @@ impl Ui {
         if metric == Metric::Net {
             y = self.nav_row(dc, rc, y, "Connections", Action::ShowConns);
         }
+
+        y = self.draw_hero(dc, rc, y, metric);
 
         // Paused shows a frozen snapshot so fast-moving rows can be clicked.
         let snap = if self.paused {
@@ -4113,10 +4345,10 @@ impl Ui {
             gdi::card(dc, &row, gdi::t().card, gdi::t().line, self.s(RADIUS));
             let name_right = self.metric_name(dc, &row, accent, glyph, label);
             let spark = RECT {
-                left: row.right - self.s(120),
+                left: row.right - self.s(SPARK_W),
                 top: y + self.s(SP3),
                 right: row.right - self.s(SP4),
-                bottom: y + self.s(40),
+                bottom: y + self.s(44),
             };
             let sticky = match ring_idx {
                 1 => &self.ceil_watch_ram,
@@ -4134,6 +4366,8 @@ impl Ui {
                 accent,
                 gdi::ChartSize::Row,
                 self.scale,
+                None,
+                None,
             );
             y += self.s(ROW_METRIC);
         }
@@ -5029,6 +5263,22 @@ fn metric_label(name: &str) -> (&'static str, u32, gdi::Glyph) {
 
 /// Nominal size of a metric glyph in a row. Design px, before `scale`.
 const GLYPH: i32 = 13;
+
+/// Nominal size of a chrome glyph inside a `CTRL_H` button. Larger than
+/// `GLYPH`: a row glyph sits beside 11 px caps and must not shout over them,
+/// but a button glyph is alone in a 24 px square and was reported as too small
+/// at 13.
+const CHROME_GLYPH: i32 = 17;
+
+/// The drill-down hero plate, and the plot inside it. Design px, before scale.
+/// Timer id for the hover cross-fade, and its frame interval. 16 ms is one
+/// display frame at 60 Hz; 90 ms is six of them.
+const ID_FADE: usize = 1;
+const FADE_MS: u32 = 16;
+const FADE_TOTAL_MS: f32 = 90.0;
+
+const HERO_H: i32 = 132;
+const HERO_PLOT_H: i32 = 72;
 
 /// Nominal size of a direction marker beside a value, and beside a secondary
 /// figure. Design px, before `scale`.

@@ -147,11 +147,11 @@ multiplies by `scale` (`gdi.rs:116`).
 
 | token | size | weight | tracking | role |
 |---|---:|---:|---:|---|
-| `display` | 26 | 600 | −10 | the one hero number per drill-down / watch view |
-| `title` | 15 | 600 | 0 | view titles in `header_ex`, watched app name |
-| `value` | 14 | 600 | 0 | metric-row values, list values, drive figures |
-| `body` | 13 | 400 | 0 | list rows, setting labels, prose |
-| `label` | 11 | 600 | +40 | metric names, chip labels, ALL-CAPS section headings |
+| `display` | 28 | 600 | −10 | the one hero number per drill-down / watch view |
+| `title` | 16 | 600 | 0 | view titles in `header_ex`, watched app name |
+| `value` | 15 | 600 | 0 | metric-row values, list values, drive figures |
+| `body` | 14 | 400 | 0 | list rows, setting labels, prose |
+| `label` | 12 | 600 | +40 | metric names, chip labels, ALL-CAPS section headings |
 | `micro` | 10 | 500 | +10 | axis ticks, timestamps, units, host names |
 
 Tracking is in 1/1000 em and is applied with **`SetTextCharacterExtra(dc, n)`**
@@ -191,6 +191,18 @@ pub fn fit_body(&self)  -> [HFONT; 2] { [self.body,  self.micro] }
 
 Cost: 6 `HFONT`s instead of 4. `Fonts::destroy` (`gdi.rs:134`) already handles
 the set as an array; extend the array.
+
+**These are one step up from this spec's first cut**, which had `body` at 13 and
+`micro` at 10. Those were *smaller* than the 14 and 11 the app already shipped,
+so adopting the scale quietly shrank every list row and every unit in the
+product — reported as "the font feels quite small", which it was. A type scale
+may re-rank sizes; it may not shrink the baseline reading size by accident.
+
+The larger type is also what settled the sparkline-versus-name trade this
+document previously listed and declined: at 15 px, `NETWORK` plus a
+nine-character rate no longer fit, so the sparkline gives up 16 px
+(`SPARK_W = 104`) and `CARD_METRIC` rises to 52 to hold a 15 px value on the
+centre line with an 11 px figure below it.
 
 ### Numerals
 

@@ -47,9 +47,24 @@ pub const ROW_NAV: i32 = 32;
 /// Navigation row plus the gap to the next.
 pub const ROW_NAV_STRIDE: i32 = 40;
 /// The metric row card itself.
-pub const CARD_METRIC: i32 = 48;
+///
+/// 52, not the 48 first specified. Raising the type scale — `value` to 15 and
+/// `micro` to 11 — left the bottom-hung secondary figure overflowing a 48 px
+/// card by a fraction of a pixel. A row that has to hold a 15 px value on its
+/// centre line *and* an 11 px figure below it needs 52.
+pub const CARD_METRIC: i32 = 52;
 /// Metric card plus the gap to the next card.
-pub const ROW_METRIC: i32 = 56;
+pub const ROW_METRIC: i32 = 60;
+
+/// Width of a metric row's sparkline.
+///
+/// 104, not the 120 first specified. With the larger type, `NETWORK` plus a
+/// nine-character rate no longer fit the band left over, and the name began to
+/// ellipsise — which the backstop is for, but it should not be reached in normal
+/// use. The sparkline gives up 16 px so the longest metric name stays whole.
+/// This is the trade the spec listed and declined at the smaller type size; the
+/// bigger type is what changed the answer.
+pub const SPARK_W: i32 = 104;
 /// The header strip holding search and the window controls.
 /// Part of the published scale; not yet consumed — see the sequencing table
 /// in `docs/design/ui-foundation.md` §9 for which step claims it.

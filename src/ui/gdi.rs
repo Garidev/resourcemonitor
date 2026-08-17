@@ -231,20 +231,27 @@ pub const TRACK_MICRO: i32 = 1;
 /// value will not otherwise clear its metric name. Weight 600 is what does most
 /// of the work: Segoe UI Semibold ships with Windows and the app previously
 /// jumped straight from 400 to 700.
+///
+/// The sizes are one step up from the first cut of this spec, which had
+/// `body` at 13 and `micro` at 10. Those were *smaller* than the 14 and 11 the
+/// app shipped with, so adopting the scale quietly shrank every list row and
+/// every unit in the product. Reported as "the font feels quite small", which
+/// it was — a type scale is allowed to re-rank sizes but not to shrink the
+/// baseline reading size by accident.
 pub struct Fonts {
-    /// 26/600 — one hero number per view.
+    /// 28/600 — one hero number per view.
     pub display: HFONT,
-    /// 15/600 — view titles, watched app name.
+    /// 16/600 — view titles, watched app name.
     pub title: HFONT,
-    /// 14/600 — metric values, list values.
+    /// 15/600 — metric values, list values.
     pub value: HFONT,
-    /// 13/400 — rows, settings, prose.
+    /// 14/400 — rows, settings, prose. The baseline reading size.
     pub body: HFONT,
-    /// 11/600 +track — identity: metric names, headings, chips.
+    /// 12/600 +track — identity: metric names, headings, chips.
     pub label: HFONT,
-    /// 10/500 +track — ticks, times, units, hosts.
+    /// 11/500 +track — ticks, times, units, hosts.
     pub micro: HFONT,
-    /// 13/600 and 12/600 — the value step's fit ladder. See §2 of the spec.
+    /// 14/600 and 13/600 — the value step's fit ladder. See §2 of the spec.
     pub value_sm: HFONT,
     pub value_xs: HFONT,
 }
@@ -253,14 +260,14 @@ impl Fonts {
     pub fn new(scale: f32) -> Self {
         let s = |v: f32| (v * scale) as i32;
         Fonts {
-            display: make_font(s(26.0), 600),
-            title: make_font(s(15.0), 600),
-            value: make_font(s(14.0), 600),
-            body: make_font(s(13.0), 400),
-            label: make_font(s(11.0), 600),
-            micro: make_font(s(10.0), 500),
-            value_sm: make_font(s(13.0), 600),
-            value_xs: make_font(s(12.0), 600),
+            display: make_font(s(28.0), 600),
+            title: make_font(s(16.0), 600),
+            value: make_font(s(15.0), 600),
+            body: make_font(s(14.0), 400),
+            label: make_font(s(12.0), 600),
+            micro: make_font(s(11.0), 500),
+            value_sm: make_font(s(14.0), 600),
+            value_xs: make_font(s(13.0), 600),
         }
     }
 
@@ -272,8 +279,8 @@ impl Fonts {
     }
 
     /// Fonts to try, largest first, when fitting a value into a width. Stops at
-    /// 12: below that a value stops being the loudest thing in its row, which
-    /// is the whole reason it is set at 14 to begin with.
+    /// 13: below that a value stops being the loudest thing in its row, which
+    /// is the whole reason it is set at 15 to begin with.
     pub fn fit_stack(&self) -> [HFONT; 3] {
         [self.value, self.value_sm, self.value_xs]
     }
@@ -688,18 +695,19 @@ pub fn icon(dc: HDC, cx: i32, cy: i32, size: i32, thickness: i32, color: u32, su
                 line(&[rp(-4.0, -0.5), rp(4.0, -0.5)]);
             }
             Icon::OnTop => {
-                let (a, b) = (p(-6.0, -4.0), p(6.0, 5.0));
-                let ob = SelectObject(dc, hollow);
-                Rectangle(dc, a.x, a.y, b.x + 1, b.y + 1);
-                SelectObject(dc, ob);
-                let band = RECT {
-                    left: a.x,
-                    top: a.y,
-                    right: b.x + 1,
-                    bottom: a.y + un(2.0).max(1),
+                // A ceiling, and something being driven up against it. The
+                // previous glyph was a window outline with a chevron over it,
+                // which at 13 px was indistinguishable from the pushpin beside
+                // it — and the two mean different things.
+                let bar = RECT {
+                    left: p(-6.5, -6.5).x,
+                    top: p(-6.5, -6.5).y,
+                    right: p(6.5, -6.5).x + 1,
+                    bottom: p(-6.5, -6.5).y + un(1.8).max(2),
                 };
-                fill(dc, &band, color);
-                line(&[p(-3.0, -6.5), p(0.0, -8.5), p(3.0, -6.5)]);
+                fill(dc, &bar, color);
+                line(&[p(0.0, 6.5), p(0.0, -2.6)]);
+                line(&[p(-4.0, 1.2), p(0.0, -3.4), p(4.0, 1.2)]);
             }
             Icon::Search => {
                 let (a, b) = (p(-5.0, -5.0), p(3.0, 3.0));
@@ -1078,6 +1086,20 @@ pub enum ChartSize {
 /// `ceiling` is supplied by the caller and is the whole reason this looks
 /// different from what it replaced: it used to be `ring.max()`, which rescaled
 /// the axis on nearly every tick.
+/// Map a cursor x onto a sample slot, or `None` if it is outside the plot or
+/// falls on a slot the window has not filled yet.
+pub fn chart_hit(r: &RECT, cap: usize, held: usize, hx: i32) -> Option<usize> {
+    let w = r.right - r.left;
+    if w <= 1 || cap < 2 || held == 0 || hx < r.left || hx >= r.right {
+        return None;
+    }
+    let start = cap - held;
+    let slot =
+        (((hx - r.left) as f32 * (cap - 1) as f32) / (w - 1) as f32).round() as i64;
+    let i = slot - start as i64;
+    if i < 0 || i as usize >= held { None } else { Some(i as usize) }
+}
+
 pub fn chart(
     dc: HDC,
     surf: Option<&Surface>,
@@ -1087,6 +1109,8 @@ pub fn chart(
     color: u32,
     size: ChartSize,
     scale: f32,
+    hover: Option<usize>,
+    font_micro: Option<HFONT>,
 ) {
     let cap = ring.capacity();
     let (w, h) = (r.right - r.left, r.bottom - r.top);
@@ -1133,6 +1157,14 @@ pub fn chart(
 
     let pts: Vec<(f32, f32)> =
         samples.iter().enumerate().map(|(i, v)| (px(i), py(*v))).collect();
+
+    // Crosshair, behind the trace: a rule the line crosses reads as an axis, a
+    // rule drawn over it reads as damage.
+    if let Some(i) = hover.filter(|i| *i < pts.len()) {
+        let hx = pts[i].0.round() as i32;
+        let rule = RECT { left: hx, top: r.top, right: hx + 1, bottom: base_y };
+        fill(dc, &rule, t().grid);
+    }
 
     // 4. Wash: clip to the area under the trace, then one vertical gradient over
     //    the whole plot. Because the gradient runs in screen y rather than per
@@ -1210,11 +1242,58 @@ pub fn chart(
         }
     }
 
+    // Peak marker: the only direct label on the plot, and it works *because*
+    // it is the only one. Suppressed when the peak is the newest sample — the
+    // head dot already says that — or when the window is flat.
+    if size == ChartSize::Hero && pts.len() > 2 {
+        let (mut pi, mut pv) = (0usize, f32::MIN);
+        for (i, v) in samples.iter().enumerate() {
+            if *v > pv {
+                (pi, pv) = (i, *v);
+            }
+        }
+        let flat = samples.iter().cloned().fold(f32::MAX, f32::min) >= pv - 0.5;
+        if pi + 1 < pts.len() && !flat && pv > 0.0 {
+            let (hx, hy) = (pts[pi].0.round() as i32, pts[pi].1.round() as i32);
+            let tick = RECT { left: hx, top: hy - 3, right: hx + 1, bottom: hy + 4 };
+            fill(dc, &tick, t().dim);
+            if let Some(f) = font_micro {
+                let label = format!("peak {}", fmt_ceiling(pv, ceiling));
+                let w = text_width(dc, f, &label);
+                // Whichever side has room; a label that runs off the plate is
+                // worse than one on the unexpected side.
+                let lx = if hx + 4 + w <= r.right { hx + 4 } else { hx - 4 - w };
+                text(dc, lx.max(r.left), hy - 14, f, t().dim, &label);
+            }
+        }
+    }
+
+    // The hovered sample's own dot, so the crosshair has something to point at.
+    if let (Some(s), Some(i)) = (surf, hover.filter(|i| *i < pts.len())) {
+        let (hx, hy) = pts[i];
+        let rad = 3.0 * scale.max(1.0);
+        aa_disc(s, r, hx, hy, rad + 1.5, t().card);
+        aa_disc(s, r, hx, hy, rad, color);
+    }
+
     // 7. Head dot: the entire motion language for "live".
     if let (Some(s), Some(&(hx, hy))) = (surf, pts.last()) {
         let rad = 2.5 * scale.max(1.0);
         aa_disc(s, r, hx, hy, rad + 1.0, t().card);
         aa_disc(s, r, hx, hy, rad, color);
+    }
+}
+
+/// Format a chart value against its ceiling. Percent ceilings mean percent
+/// values; anything else is a rate or a byte count and is left to the caller's
+/// units, so this only has to be right about the percent case.
+fn fmt_ceiling(v: f32, ceiling: f32) -> String {
+    if (ceiling - 100.0).abs() < 0.01 {
+        format!("{:.0}%", v)
+    } else if v >= 100.0 {
+        format!("{:.0}", v)
+    } else {
+        format!("{:.1}", v)
     }
 }
 
