@@ -315,7 +315,7 @@ pub struct Ui {
     /// focus from the inputs. The rule-editor shape covers both the chosen
     /// metric and the connection field, because either one changes which
     /// boxes exist and what they are asking for.
-    edit_sig: (u32, u32, bool, bool, i32, i32),
+    edit_sig: (u32, u32, bool, bool, i32, i32, i32),
     /// Cursor position in client coords while inside the window; drives
     /// hover highlighting of clickable rows.
     hover_pos: Option<(i32, i32)>,
@@ -543,7 +543,7 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         draft: RuleDraft::default(),
         overlay: std::ptr::null_mut(),
         widget: std::ptr::null_mut(),
-        edit_sig: (u32::MAX, u32::MAX, false, false, 0, 0),
+        edit_sig: (u32::MAX, u32::MAX, false, false, 0, 0, 0),
         hover_pos: None,
         mouse_tracking: false,
         autostart_on: false,
@@ -1547,7 +1547,7 @@ impl Ui {
                 self.draft.deliver = i;
                 // The path row appears or disappears, so the EDIT children
                 // must be repositioned.
-                self.edit_sig = (u32::MAX, u32::MAX, false, false, 0, 0);
+                self.edit_sig = (u32::MAX, u32::MAX, false, false, 0, 0, 0);
                 unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
             }
             Action::DraftTop => {
@@ -1967,7 +1967,19 @@ impl Ui {
         // subs_expanded matters because the watch view's filter box only
         // exists while the subprocess list is open; the FPS row because it
         // shifts everything below it by a row when it appears or decays away.
-        let sig = (code, draft_shape, self.subs_expanded, self.watch_has_fps(), rc.right, rc.bottom);
+        // `code` cannot tell one drill-down from another, but the network one
+        // carries a Connections row that pushes its filter box down. Keying on
+        // the y we are about to position the child at catches that, and any
+        // future layout change that moves the box, without another special case.
+        let sig = (
+            code,
+            draft_shape,
+            self.subs_expanded,
+            self.watch_has_fps(),
+            rc.right,
+            rc.bottom,
+            self.filter_input_y(),
+        );
         if sig == self.edit_sig {
             return;
         }
@@ -3118,9 +3130,49 @@ impl Ui {
         self.s(40 + 10)
     }
 
-    /// Y of the drill-down filter EDIT control (below the header).
+    /// Height of a nav row, and the stride to the next thing below it.
+    fn nav_row_h(&self) -> i32 {
+        self.s(30)
+    }
+    fn nav_row_stride(&self) -> i32 {
+        self.s(36)
+    }
+
+    /// A slim row that goes somewhere rather than reporting a number. Used
+    /// for "Connections" in both the app detail and the network drill-down,
+    /// so the two ways in look like the same control. Deliberately shorter
+    /// than a metric row: it has no value and no sparkline, and matching
+    /// their height would just read as a sparkline that failed to load.
+    fn nav_row(&mut self, dc: HDC, rc: &RECT, y: i32, label: &str, action: Action) -> i32 {
+        let pad = self.s(12);
+        let row = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + self.nav_row_h() };
+        self.hover_fill(dc, &row, gdi::t().card);
+        gdi::text(dc, row.left + self.s(10), y + self.s(7), self.fonts.small, gdi::ACC_NET, label);
+        let chev = "›";
+        let cw = gdi::text_width(dc, self.fonts.small, chev);
+        gdi::text(
+            dc,
+            row.right - self.s(10) - cw,
+            y + self.s(7),
+            self.fonts.small,
+            gdi::t().dim,
+            chev,
+        );
+        self.hits.push((row, action));
+        y + self.nav_row_stride()
+    }
+
+    /// Y of the drill-down filter EDIT control (below the header). The
+    /// network drill-down carries a Connections row above its filter, so the
+    /// input — a real EDIT child positioned from this in `update_edit` —
+    /// starts that much further down there and nowhere else.
     fn filter_input_y(&self) -> i32 {
-        self.s(12) + self.header_height() + self.s(3)
+        let nav = if matches!(self.view, View::Drill(Metric::Net)) {
+            self.nav_row_stride()
+        } else {
+            0
+        };
+        self.s(12) + self.header_height() + self.s(3) + nav
     }
 
     fn draw_drill(&mut self, dc: HDC, rc: &RECT, metric: Metric) {
@@ -3134,21 +3186,14 @@ impl Ui {
             Metric::Net => ("Top apps by network use", gdi::ACC_NET),
             Metric::Audio => ("Apps playing sound", gdi::ACC_AUDIO),
         };
-        // The network list answers "how much"; the endpoints list answers
-        // "to whom", which is one click away rather than a separate feature.
-        y = if metric == Metric::Net {
-            self.header_ex(
-                dc,
-                rc,
-                y,
-                title,
-                accent,
-                Some(("endpoints", gdi::ACC_NET, Action::ShowConns)),
-                false,
-            )
-        } else {
-            self.header(dc, rc, y, title, accent)
-        };
+        y = self.header(dc, rc, y, title, accent);
+        // The network list answers "how much"; the connections list answers
+        // "to whom". It gets a row of its own directly above the filter
+        // rather than a word tucked into the header, where it read as
+        // decoration and was easy to miss.
+        if metric == Metric::Net {
+            y = self.nav_row(dc, rc, y, "Connections", Action::ShowConns);
+        }
 
         // Paused shows a frozen snapshot so fast-moving rows can be clicked.
         let snap = if self.paused {
@@ -3565,23 +3610,16 @@ impl Ui {
             };
             gdi::text_fit(dc, row.left + self.s(10), y + self.s(21), spark.left - self.s(6), &fit, gdi::t().text, &value);
             gdi::sparkline(dc, &spark, &self.watch_rings[ring_idx], max, accent);
-            // The network row is the one that has somewhere further to go:
-            // clicking it asks who this app is actually talking to.
-            if ring_idx == 4 {
-                let hint = "endpoints ›";
-                let hw = gdi::text_width(dc, self.fonts.small, hint);
-                gdi::text(
-                    dc,
-                    spark.left - self.s(10) - hw,
-                    y + self.s(6),
-                    self.fonts.small,
-                    gdi::t().dim,
-                    hint,
-                );
-                self.hits.push((row, Action::ShowAppConns));
-            }
             y += self.s(52);
         }
+
+        // Where this app is talking to, as its own item rather than a hint
+        // buried in the Network row. It carries no number: connections are
+        // only enumerated while the list is open, so a live count here would
+        // mean sweeping forever behind a screen nobody is looking at.
+        // The subprocess block below re-anchors from `proc_layout`, which
+        // accounts for this row, so the returned y is deliberately dropped.
+        self.nav_row(dc, rc, y, "Connections", Action::ShowAppConns);
 
         // --- subprocesses: collapsed by default (a browser can be 70+ rows).
         // Expand for the individual processes, labelled by role where the
@@ -4123,8 +4161,13 @@ impl Ui {
     /// drift from the frame painted under it.
     fn proc_layout(&self) -> ProcLayout {
         let rows = if self.watch_has_fps() { 6 } else { 5 };
-        let y_subs_header =
-            self.s(12) + self.header_height() + self.s(24) + rows * self.s(52) + self.s(6);
+        // The metric stack, then the Connections row, then the subprocesses.
+        let y_subs_header = self.s(12)
+            + self.header_height()
+            + self.s(24)
+            + rows * self.s(52)
+            + self.nav_row_stride()
+            + self.s(6);
         let y_filter = y_subs_header + self.s(36);
         let y_chips = y_filter + self.s(28);
         let y_list = y_chips + self.s(28);

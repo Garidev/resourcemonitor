@@ -475,7 +475,7 @@ mod tests {
     enum Screen {
         Main,
         NetDrill,
-        Endpoints,
+        Conns,
         App,
         Settings,
     }
@@ -498,24 +498,24 @@ mod tests {
     fn back_walks_out_the_way_it_came() {
         let mut t = NavTrail::new(16);
         t.advance(Screen::Main, Screen::NetDrill);
-        t.advance(Screen::NetDrill, Screen::Endpoints);
-        t.advance(Screen::Endpoints, Screen::App);
+        t.advance(Screen::NetDrill, Screen::Conns);
+        t.advance(Screen::Conns, Screen::App);
         assert_eq!(
             walk_back(&mut t),
-            vec![Screen::Endpoints, Screen::NetDrill, Screen::Main]
+            vec![Screen::Conns, Screen::NetDrill, Screen::Main]
         );
     }
 
     #[test]
-    fn an_app_and_its_endpoints_cannot_trap_back() {
-        // The reported bug: opening an app from the endpoint list and then
-        // its endpoints again left back bouncing between the two forever.
+    fn an_app_and_its_connections_cannot_trap_back() {
+        // The reported bug: opening an app from the connections list and then
+        // its connections again left back bouncing between the two forever.
         let mut t = NavTrail::new(16);
         t.advance(Screen::Main, Screen::NetDrill);
-        t.advance(Screen::NetDrill, Screen::Endpoints);
-        t.advance(Screen::Endpoints, Screen::App);
-        // ...and back to the endpoints, filtered to that app.
-        t.advance(Screen::App, Screen::Endpoints);
+        t.advance(Screen::NetDrill, Screen::Conns);
+        t.advance(Screen::Conns, Screen::App);
+        // ...and back to the connections, filtered to that app.
+        t.advance(Screen::App, Screen::Conns);
         // The second visit collapsed onto the first, so back still leads out.
         assert_eq!(walk_back(&mut t), vec![Screen::NetDrill, Screen::Main]);
     }
@@ -526,8 +526,8 @@ mod tests {
         t.advance(Screen::Main, Screen::App);
         let depth = t.depth();
         for _ in 0..20 {
-            t.advance(Screen::App, Screen::Endpoints);
-            t.advance(Screen::Endpoints, Screen::App);
+            t.advance(Screen::App, Screen::Conns);
+            t.advance(Screen::Conns, Screen::App);
         }
         assert_eq!(t.depth(), depth, "a round trip must not grow the trail");
         assert_eq!(walk_back(&mut t), vec![Screen::Main]);

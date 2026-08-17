@@ -33,9 +33,10 @@ reads a handful of system counters at the chosen interval.
 - Per-app network usage via the `Microsoft-Windows-Kernel-Network` ETW
   provider; per-app GPU via PDH "GPU Engine" counters; per-app sound via the
   Core Audio session API (the same source as the volume mixer).
-- **Live connections**: "endpoints" in the network drill-down (or the network
-  row of any watched app) lists every open connection with the app that owns
-  it, the remote address and port, and the hostname it resolved from —
+- **Live connections**: a "Connections" row in the network drill-down (or in
+  any watched app's own list, below its metrics) lists every open connection
+  with the app that owns it, the remote address and port, and the hostname it
+  resolved from —
   `Microsoft-Windows-DNS-Client` ETW events supply names *with the process
   that asked*, which a machine-wide DNS cache dump cannot. Names fall back to
   reverse lookups, and a row with no name says so rather than guessing.
