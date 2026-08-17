@@ -355,6 +355,14 @@ pub struct Ui {
     layout_footer: usize,
     /// Visible metric-row count the current window height was computed for.
     layout_metrics: usize,
+    /// The hero plot's rect from the last paint, and the sample index the last
+    /// paint was for. A repaint normally happens only when the hovered *hit*
+    /// changes, and the whole plot is a single region — so moving across it
+    /// changed nothing to repaint and the readout only caught up on the next
+    /// snapshot, about a second later. These two let a move that lands on a
+    /// different sample ask for a repaint, and a move that does not stay cheap.
+    hero_plot: RECT,
+    hero_sample: Option<usize>,
     /// Where a click on the balloon currently on screen should land.
     balloon_target: Option<View>,
     /// Notifications waiting to be shown. `Shell_NotifyIcon` gives an icon one
@@ -401,7 +409,7 @@ pub struct Ui {
     /// focus from the inputs. The rule-editor shape covers both the chosen
     /// metric and the connection field, because either one changes which
     /// boxes exist and what they are asking for.
-    edit_sig: (u32, u32, bool, bool, i32, i32, i32),
+    edit_sig: (u32, u32, bool, bool, bool, i32, i32, i32),
     /// Cursor position in client coords while inside the window; drives
     /// hover highlighting of clickable rows.
     hover_pos: Option<(i32, i32)>,
@@ -700,6 +708,8 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         layout_drives: 0,
         layout_footer: 0,
         layout_metrics: 0,
+        hero_plot: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+        hero_sample: None,
         balloon_target: None,
         balloon_queue: std::collections::VecDeque::new(),
         balloon_timer: false,
@@ -722,7 +732,7 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         draft: RuleDraft::default(),
         overlay: std::ptr::null_mut(),
         widget: std::ptr::null_mut(),
-        edit_sig: (u32::MAX, u32::MAX, false, false, 0, 0, 0),
+        edit_sig: (u32::MAX, u32::MAX, false, false, false, 0, 0, 0),
         hover_pos: None,
         mouse_tracking: false,
         autostart_on: false,
@@ -895,7 +905,30 @@ impl Ui {
                         self.fade_timer = true;
                     }
                 }
-                if before != after || self.metric_drag.is_some() {
+                // A move inside the hero plot changes the reading without
+                // changing the hit, so it needs its own repaint trigger — but only
+                // when it lands on a different sample, or a 60-sample window would
+                // repaint on every pixel of travel for nothing.
+                let sample = {
+                    let p = self.hero_plot;
+                    let inside = x >= p.left && x < p.right && y >= p.top && y < p.bottom;
+                    let hero = match self.view {
+                        View::Drill(m) => Some(Hero::M(m)),
+                        View::FpsApps => Some(Hero::Fps),
+                        _ => None,
+                    };
+                    match (inside, hero) {
+                        (true, Some(h)) => {
+                            let (ring, _, _, _) = self.hero_series(h);
+                            let (cap, held) = (ring.capacity(), ring.iter().count());
+                            gdi::chart_hit(&p, cap, held, x)
+                        }
+                        _ => None,
+                    }
+                };
+                let moved_sample = sample != self.hero_sample;
+                self.hero_sample = sample;
+                if before != after || moved_sample || self.metric_drag.is_some() {
                     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
                 }
                 Some(0)
@@ -1149,10 +1182,16 @@ impl Ui {
         // so the shared scale left the secondary flat on the midline. Both
         // ceilings are labelled on the hero plot, so the asymmetry is stated
         // rather than hidden.
-        self.ceil_disk.update(self.hist_disk.max());
-        self.ceil_disk_w.update(self.hist_disk_w.max());
-        self.ceil_net.update(self.hist_net.max());
-        self.ceil_net_tx.update(self.hist_net_tx.max());
+        // Scaled to the 90th percentile, not the maximum. Reported: occasional
+        // MB/s bursts on an otherwise quiet link made every ordinary reading a
+        // flat line, and the burst was the only thing the graph said. See
+        // `Ring::high` for why the maximum cannot recover from that on its own.
+        // Brief spikes now clip at the top, where the peak label names them; a
+        // sustained transfer raises the percentile with it and does not clip.
+        self.ceil_disk.update(self.hist_disk.high(RATE_CEIL_Q));
+        self.ceil_disk_w.update(self.hist_disk_w.high(RATE_CEIL_Q));
+        self.ceil_net.update(self.hist_net.high(RATE_CEIL_Q));
+        self.ceil_net_tx.update(self.hist_net_tx.high(RATE_CEIL_Q));
         // 0 when nothing is presenting, so the graph flatlines rather than
         // holding the last frame rate of an app that has since closed.
         self.hist_fps.push(s.fps.as_ref().map(|(_, _, f)| *f as f32).unwrap_or(0.0));
@@ -1172,10 +1211,10 @@ impl Ui {
                 self.watch_rings[5].push(watch_fps(&self.snap, &name) as f32);
                 self.watch_rings[8].push(a.audio * 100.0);
                 self.ceil_watch_ram.update(self.watch_rings[1].max());
-                self.ceil_watch_disk.update(self.watch_rings[3].max());
-                self.ceil_watch_disk_w.update(self.watch_rings[6].max());
-                self.ceil_watch_net_tx.update(self.watch_rings[7].max());
-                self.ceil_watch_net.update(self.watch_rings[4].max());
+                self.ceil_watch_disk.update(self.watch_rings[3].high(RATE_CEIL_Q));
+                self.ceil_watch_disk_w.update(self.watch_rings[6].high(RATE_CEIL_Q));
+                self.ceil_watch_net_tx.update(self.watch_rings[7].high(RATE_CEIL_Q));
+                self.ceil_watch_net.update(self.watch_rings[4].high(RATE_CEIL_Q));
             }
         }
         }
@@ -2101,7 +2140,7 @@ impl Ui {
                 self.draft.deliver = i;
                 // The path row appears or disappears, so the EDIT children
                 // must be repositioned.
-                self.edit_sig = (u32::MAX, u32::MAX, false, false, 0, 0, 0);
+                self.edit_sig = (u32::MAX, u32::MAX, false, false, false, 0, 0, 0);
                 unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
             }
             Action::DraftTop => {
@@ -2530,6 +2569,7 @@ impl Ui {
             draft_shape,
             self.subs_expanded,
             self.watch_has_fps(),
+            self.watch_has_audio(),
             rc.right,
             rc.bottom,
             self.filter_input_y(),
@@ -3198,6 +3238,7 @@ impl Ui {
                 None,
                 chart_units(scale),
                 mirror,
+                false,
             );
             self.hits.push((row, action));
             y += self.s(ROW_METRIC);
@@ -3933,9 +3974,11 @@ impl Ui {
             bottom: plot_top + plot_h,
         };
 
-        // Everything that mutates `self` happens before the ring is borrowed for
-        // drawing: `held` comes from a scoped borrow so the pin can be dropped
-        // and the hit registered without holding a reference across either.
+        // Mutations happen before the ring is borrowed for drawing, so `held`
+        // comes from a scoped borrow. `hero_plot` is remembered here for
+        // `WM_MOUSEMOVE`, which needs the rect to tell whether a move landed on a
+        // different sample and therefore needs a repaint.
+        self.hero_plot = plot;
         let held = {
             let (ring, _, _, _) = self.hero_series(h);
             ring.iter().count()
@@ -4097,6 +4140,7 @@ impl Ui {
                 }),
                 _ => None,
             },
+            !matches!(h, Hero::M(Metric::Audio)),
         );
 
         // Window and ceiling labels. The window is derived, not hardcoded —
@@ -4704,10 +4748,15 @@ impl Ui {
 
         let a = watch_sums(&self.snap.procs, &name);
         let fps = watch_fps(&self.snap, &name);
-        let mut rows: Vec<(&str, u32, gdi::Glyph, Figures, usize, Scale)> = Vec::with_capacity(6);
-        // FPS leads, but only for apps that are actually presenting frames.
+        // Keyed by the same names `cfg.main_metrics` uses, so the stack can be put
+        // in the order the user chose rather than the order this function happens
+        // to push in.
+        let mut rows: Vec<(&str, &str, u32, gdi::Glyph, Figures, usize, Scale)> =
+            Vec::with_capacity(7);
+        // FPS appears only for apps that are actually presenting frames.
         if fps > 0 || self.watch_rings[5].max() > 0.0 {
             rows.push((
+                "fps",
                 "FPS",
                 gdi::acc().fps,
                 gdi::Glyph::Fps,
@@ -4721,6 +4770,7 @@ impl Ui {
             ));
         }
         rows.push((
+            "cpu",
             "CPU",
             gdi::acc().cpu,
             gdi::Glyph::Cpu,
@@ -4729,6 +4779,7 @@ impl Ui {
             Scale::Percent,
         ));
         rows.push((
+            "ram",
             "RAM",
             gdi::acc().ram,
             gdi::Glyph::Ram,
@@ -4739,6 +4790,7 @@ impl Ui {
             Scale::Rate,
         ));
         rows.push((
+            "gpu",
             "GPU",
             gdi::acc().gpu,
             gdi::Glyph::Gpu,
@@ -4747,6 +4799,7 @@ impl Ui {
             Scale::Percent,
         ));
         rows.push((
+            "disk",
             "Disk",
             gdi::acc().disk,
             gdi::Glyph::Disk,
@@ -4759,8 +4812,9 @@ impl Ui {
         // Sound, when the app is actually playing something. Reported as the
         // level rather than as a count: "2 playing" answers a question about the
         // machine, and this view is about one app.
-        if a.audio > 0.01 || self.watch_rings[8].max() > 0.0 {
+        if self.watch_has_audio() {
             rows.push((
+                "audio",
                 "Sound",
                 gdi::acc().audio,
                 gdi::Glyph::Audio,
@@ -4774,6 +4828,7 @@ impl Ui {
             ));
         }
         rows.push((
+            "net",
             "Network",
             gdi::acc().net,
             gdi::Glyph::Net,
@@ -4786,7 +4841,13 @@ impl Ui {
             4,
             Scale::Rate,
         ));
-        for (label, accent, glyph, figs, ring_idx, scale) in rows {
+        // Emit in the user's configured order, so a metric sits in the same place
+        // when inspecting one app as it does on the main panel. Order only, not
+        // visibility: hiding GPU on the panel is a statement about the panel's
+        // height, not about what is worth knowing once one app is open on purpose.
+        let order: Vec<&str> = self.cfg.main_metrics.iter().map(|(n, _)| n.as_str()).collect();
+        rows.sort_by_key(|r| order.iter().position(|n| *n == r.0).unwrap_or(usize::MAX));
+        for (_key, label, accent, glyph, figs, ring_idx, scale) in rows {
             let row = RECT {
                 left: pad,
                 top: y,
@@ -4838,6 +4899,7 @@ impl Ui {
                     }),
                     _ => None,
                 },
+                false,
             );
             y += self.s(ROW_METRIC);
         }
@@ -5408,11 +5470,34 @@ impl Ui {
         watch_fps(&self.snap, &name) > 0 || self.watch_rings[5].max() > 0.0
     }
 
+    /// Whether the watch view is showing its Sound row. Same shape as
+    /// `watch_has_fps`, and it exists for the same reason: the row is
+    /// conditional, so anything that needs to know how tall the metric stack is
+    /// has to ask rather than assume.
+    fn watch_has_audio(&self) -> bool {
+        let name = self.watch.clone().unwrap_or_default();
+        let level = self
+            .snap
+            .procs
+            .iter()
+            .filter(|p| p.name == name)
+            .fold(0.0f32, |m, p| m.max(p.audio));
+        level > 0.01 || self.watch_rings[8].max() > 0.0
+    }
+
     /// Shared layout for the watch view's subprocess section. `draw_process`
     /// and `update_edit` both derive from this so the filter EDIT can never
     /// drift from the frame painted under it.
     fn proc_layout(&self) -> ProcLayout {
-        let rows = if self.watch_has_fps() { 6 } else { 5 };
+        // Five metric rows always, plus the two conditional ones. This was
+        // `if watch_has_fps() { 6 } else { 5 }` — a hardcoded count, which is the
+        // very thing the note below warns about. Adding the Sound row made the
+        // paint draw seven where this still said six, so the subprocess header
+        // moved a row up and landed on the Connections row again, which is the
+        // second time that exact collision has happened for the same reason.
+        let rows = 5
+            + i32::from(self.watch_has_fps())
+            + i32::from(self.watch_has_audio());
         // The metric stack, then the Connections row, then the subprocesses.
         //
         // These must be the *same* constants the paint uses. This formula
@@ -5777,6 +5862,11 @@ const CHROME_GLYPH: i32 = 17;
 /// The drill-down hero plate, and the plot inside it. Design px, before scale.
 /// Timer id for the hover cross-fade, and its frame interval. 16 ms is one
 /// display frame at 60 Hz; 90 ms is six of them.
+/// Quantile the rate ceilings scale to. At a 60-sample window this excludes the
+/// top six readings, so a burst has to last about a tenth of the window before it
+/// starts lifting the axis — which is the line between "a spike happened" and
+/// "this is the traffic now".
+const RATE_CEIL_Q: f32 = 0.9;
 const ID_FADE: usize = 1;
 const ID_BALLOON: usize = 2;
 /// Windows shows a tray balloon for around five seconds, so anything much

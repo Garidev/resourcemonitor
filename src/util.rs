@@ -255,6 +255,32 @@ impl Ring {
         self.iter().fold(0.0f32, f32::max)
     }
 
+    /// The value `frac` of the way up the sorted window: `high(1.0)` is `max`,
+    /// `high(0.9)` is the 90th percentile.
+    ///
+    /// This is what the rate ceilings scale to, instead of `max`. A network
+    /// trace spends most of its life in the tens of KB/s and bursts to megabytes
+    /// every so often. Scaled to the window's maximum, one burst makes every
+    /// ordinary reading a flat line on the baseline for as long as it stays in
+    /// the window — and because the maximum is recomputed over the whole window
+    /// each tick, the ceiling's decay cannot even begin until the burst falls out
+    /// of it, so a single spike flattens a full minute of history.
+    ///
+    /// Scaled to a high percentile the usual shape is legible and the rare burst
+    /// clips at the top, where the peak label names its real value. Clipping the
+    /// exception is better than hiding the rule: a sustained transfer raises the
+    /// percentile with it and does not clip at all, so only the brief spikes —
+    /// the ones whose exact height matters least — go off scale.
+    pub fn high(&self, frac: f32) -> f32 {
+        let mut v: Vec<f32> = self.iter().filter(|x| x.is_finite() && *x >= 0.0).collect();
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let i = ((v.len() - 1) as f32 * frac.clamp(0.0, 1.0)).round() as usize;
+        v[i.min(v.len() - 1)]
+    }
+
     pub fn capacity(&self) -> usize {
         self.buf.len()
     }
@@ -567,6 +593,33 @@ mod tests {
         for m in [30.0, 44.0, 33.0, 41.0, 38.0, 45.0, 31.0] {
             assert_eq!(c.update(m), first, "ceiling moved on a {m} sample");
         }
+    }
+
+    #[test]
+    fn ring_high_ignores_the_rare_spike() {
+        // The reported failure: occasional MB/s bursts on an otherwise quiet
+        // link made everything else draw as a flat line.
+        let mut r = Ring::new(60);
+        for _ in 0..57 {
+            r.push(200_000.0);
+        }
+        for _ in 0..3 {
+            r.push(12_000_000.0);
+        }
+        assert_eq!(r.max(), 12_000_000.0, "max still reports the burst");
+        assert_eq!(r.high(0.9), 200_000.0, "the 90th percentile ignores it");
+        // A sustained transfer is not a spike and must raise the scale with it.
+        let mut r2 = Ring::new(60);
+        for _ in 0..60 {
+            r2.push(12_000_000.0);
+        }
+        assert_eq!(r2.high(0.9), 12_000_000.0);
+        // Degenerate inputs.
+        assert_eq!(Ring::new(8).high(0.9), 0.0);
+        let mut r3 = Ring::new(4);
+        r3.push(f32::NAN);
+        r3.push(5.0);
+        assert_eq!(r3.high(1.0), 5.0);
     }
 
     #[test]

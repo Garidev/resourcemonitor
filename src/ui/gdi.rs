@@ -1225,6 +1225,11 @@ pub fn chart(
     font_micro: Option<HFONT>,
     units: Units,
     mirror: Option<Mirror>,
+    // `peak_marker`: whether a peak is a meaningful thing to name on this
+    // series. False for sound, where the row is a *level* and "peak 62%" beside
+    // a volume reads as a peak meter — a different measurement the app does not
+    // take. Also false for every Row-size chart, which draws no peak anyway.
+    peak_marker: bool,
 ) {
     let cap = ring.capacity();
     let (w, h) = (r.right - r.left, r.bottom - r.top);
@@ -1425,7 +1430,17 @@ pub fn chart(
     // ceilings an unlabelled high point says nothing about how high it was.
     // Suppressed when the peak is the newest sample — the head dot already says
     // that — or when the window is flat.
-    if size == ChartSize::Hero {
+    if size == ChartSize::Hero && peak_marker {
+        // The tick marks *where* the peak was; a label in a fixed slot says how
+        // big it was. Placing the label beside its tick meant it moved with the
+        // data, so near an edge it landed on whatever the corner already held —
+        // the direction labels at the left, the ceilings at the right, and at the
+        // very start of the window all of it at once. A slot cannot collide, and
+        // nothing is lost: the tick is what carries the position.
+        //
+        // Upper series takes the top row, lower series the bottom, each starting
+        // after that half's direction label so the two read as one line:
+        // "Read   peak 19.1 MB/s".
         let peak = |pts: &[(f32, f32)], samples: &[f32], below: bool| {
             if pts.len() <= 2 {
                 return;
@@ -1436,6 +1451,8 @@ pub fn chart(
                     (pi, pv) = (i, *v);
                 }
             }
+            // Suppressed when the peak is the newest sample — the head dot
+            // already says so — or when the window is flat.
             let flat = samples.iter().cloned().fold(f32::MAX, f32::min) >= pv - 0.5;
             if pi + 1 >= pts.len() || flat || pv <= 0.0 {
                 return;
@@ -1443,17 +1460,28 @@ pub fn chart(
             let (hx, hy) = (pts[pi].0.round() as i32, pts[pi].1.round() as i32);
             let tick = RECT { left: hx, top: hy - 3, right: hx + 1, bottom: hy + 4 };
             fill(dc, &tick, t().dim);
-            if let Some(f) = font_micro {
-                let label = format!("peak {}", units.fmt(pv));
-                let w = text_width(dc, f, &label);
-                let (asc, desc, _) = text_metrics(dc, f);
-                // Whichever side has room; a label that runs off the plate is
-                // worse than one on the unexpected side.
-                let lx = if hx + 4 + w <= r.right { hx + 4 } else { hx - 4 - w };
-                // The lower half's label hangs below its point, or the two halves
-                // would write over each other around the midline.
-                let ly = if below { hy + 5 } else { hy - (asc + desc) - 3 };
-                text(dc, lx.max(r.left), ly, f, t().dim, &label);
+
+            let Some(f) = font_micro else { return };
+            let label = format!("peak {}", units.fmt(pv));
+            let (asc, desc, _) = text_metrics(dc, f);
+            let lh = asc + desc;
+            let dir = match &mirror {
+                Some(m) => text_width(dc, f, if below { m.label_lo } else { m.label_hi }) + 10,
+                None => 0,
+            };
+            let lx = r.left + 2 + dir;
+            let ly = if below { r.bottom - lh - 1 } else { r.top + 1 };
+            // The ceiling labels are right-aligned on these same two rows, so on
+            // a narrow plot the two can still meet. Then the label goes, not the
+            // ceiling: a scale you cannot read makes the whole plot unreadable,
+            // and the tick still shows where the peak was.
+            let ceil_w = if below {
+                mirror.as_ref().map_or(0, |m| text_width(dc, f, &units.fmt(m.ceiling)) + 10)
+            } else {
+                text_width(dc, f, &units.fmt(ceiling)) + 10
+            };
+            if lx + text_width(dc, f, &label) <= r.right - ceil_w {
+                text(dc, lx, ly, f, t().dim, &label);
             }
         };
         peak(&pts, &samples, false);

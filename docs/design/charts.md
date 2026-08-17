@@ -102,12 +102,28 @@ Per metric, per tick:
 Sticky, for the rate metrics — one extra `f32` per ring:
 
 ```rust
-self.ceil_raw = window_max.max(self.ceil_raw * 0.93);   // rises instantly, decays ~7%/tick
+self.ceil_raw = ring.high(0.9).max(self.ceil_raw * 0.93);  // rises at once, decays ~7%/tick
 let ceiling  = nice(self.ceil_raw);
 ```
 
+> **Revised after implementation.** This fed the ceiling `window_max`, and that
+> has a failure the decay cannot rescue. A network link spends most of its life in
+> the tens of KB/s and bursts to megabytes now and then; one burst sets the
+> ceiling, and because the maximum is recomputed over the whole retained window on
+> every tick, `ceil_raw * 0.93` can never fall below it until the burst leaves the
+> window. A single spike therefore flattens a full minute of history, which was
+> reported as ordinary usage being impossible to see.
+>
+> The input is the **90th percentile of the window**, not its maximum. At sixty
+> samples that excludes the top six, so a burst has to last about a tenth of the
+> window before it lifts the axis — the line between "a spike happened" and "this
+> is the traffic now". A sustained transfer raises the percentile with it and never
+> clips; a brief spike clips at the top, where the peak marker names its true
+> value. Clipping the exception is better than hiding the rule, and the exception
+> is the reading whose exact height matters least.
+
 The trace holds still while traffic varies, and the ceiling steps by a clean
-factor of 2 or 2.5 when the order of magnitude genuinely changes — roughly once
+factor of 2 or 2.5 when the typical order of magnitude genuinely changes — roughly once
 every thirty ticks at worst, not every tick. Because `nice` quantises, a decay
 of 7 % per tick produces a ceiling change only when it crosses a step boundary.
 
