@@ -1666,7 +1666,12 @@ impl Ui {
         let Some(sub) = &f.sub else { return };
         let suw = self.unit_w(dc, f.sub_unit);
         let sy = gdi::bottom_y(dc, self.fonts.micro, card.bottom, self.s(SP1));
-        let sub_ink = if f.sub_is_figure { gdi::t().dim } else { gdi::t().mute };
+        // A number is a number: a secondary figure reads in `text`, the same ink
+        // as the value above it, and is separated from it by size alone. `dim`
+        // was the first attempt at this and was still reported as too faint —
+        // which it was, because the row's own value sits beside it in `text` and
+        // gives the eye an immediate comparison.
+        let sub_ink = if f.sub_is_figure { gdi::t().text } else { gdi::t().mute };
         gdi::text_right_t(
             dc,
             right - suw,
@@ -1679,7 +1684,10 @@ impl Ui {
         match f.sub_unit {
             Unit::None => {}
             // The noun after a secondary figure stays `mute` while the figure
-            // itself is `dim`: `290 KB/s` has to be readable, `write` does not.
+            // itself is `text`: `290 KB/s` has to be readable, `write` does not.
+            // This is the rule the whole row follows — figures in `text`, the
+            // units and nouns naming them in `mute` — so the primary value's
+            // `used`/`read` and the direction markers stay quiet too.
             Unit::Word(w) => {
                 gdi::text_t(
                     dc,
@@ -5434,10 +5442,16 @@ struct Figures {
     unit: Unit,
     sub: Option<String>,
     sub_unit: Unit,
-    /// True when `sub` is a figure rather than prose. A figure is set in `dim`
-    /// so it stays readable; prose — a process name, `of`, `in` — stays `mute`.
-    /// Reported directly: the secondary numbers were too faint to read while
-    /// the words beside them were fine grey.
+    /// True when `sub` is a figure rather than prose. A figure is set in `text`,
+    /// the same ink as the primary value, and is distinguished from it by size
+    /// alone; prose — a process name, `of`, `in` — stays `mute`.
+    ///
+    /// Reported twice. The first report said the secondary numbers were too
+    /// faint to read while the words beside them were fine grey, and `dim` was
+    /// the answer. The second said `dim` was still too faint, and it is right:
+    /// the row puts a `text` value directly above a `dim` one, so the eye has
+    /// the brighter ink to compare against and reads the dimmer as disabled.
+    /// Size already says which figure is secondary.
     sub_is_figure: bool,
 }
 
@@ -5457,7 +5471,7 @@ impl Figures {
         self
     }
 
-    /// A secondary figure: set in `dim`, because it is a number the user reads.
+    /// A secondary figure: set in `text`, because it is a number the user reads.
     fn sub(mut self, s: String, u: Unit) -> Self {
         self.sub = Some(s);
         self.sub_unit = u;

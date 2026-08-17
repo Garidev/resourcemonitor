@@ -257,12 +257,26 @@ the label in place.
 ### The value line
 
 A metric row carries up to three pieces of text on the right: the value, its
-unit, and sometimes a secondary figure. Two rules:
+unit, and sometimes a secondary figure. Three rules:
 
 1. **The value is baseline-centred on the card midline in every row**, whether
    or not that row has a secondary figure.
 2. **The secondary figure is bottom-anchored**, drawn as its own `text_right`
    rather than concatenated into the value string.
+3. **Figures take `text`; the words and markers naming them take `mute`.** Size
+   is what separates a secondary figure from a primary one — never ink. So
+   `12 MB/s` reads in `text` at the `micro` step while `write` beside it stays
+   `mute`, and the network row's `↑` marker stays `mute` for the same reason.
+   Prose is not a figure: `in Cyberpunk2077.exe` and `run as administrator to
+   see` stay `mute` whole.
+
+   Rule 3 was learned twice. The secondary figures were first drawn in `mute`
+   and reported as unreadable, which moved them to `dim`; `dim` was reported as
+   unreadable too. The reason is comparative, not absolute — the row puts a
+   `text` value directly above its secondary, so the eye has the brighter ink
+   right there to measure against and reads anything below it as disabled. Any
+   ink short of `text` will keep failing this, which is why the rule is stated
+   as ink parity rather than as a contrast number.
 
 This exists because the obvious layout — stack value over secondary and centre
 the pair — is wrong. It puts the value ~5 px above the midline in rows that
