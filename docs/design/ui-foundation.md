@@ -204,6 +204,42 @@ nine-character rate no longer fit, so the sparkline gives up 16 px
 (`SPARK_W = 104`) and `CARD_METRIC` rises to 52 to hold a 15 px value on the
 centre line with an 11 px figure below it.
 
+### Roles belong in functions, not in arguments
+
+The first implementation of this scale diverged from it immediately, and the
+mechanism is worth recording because it will happen again otherwise.
+
+The old four-font set was renamed to the new six in bulk: every 11/400 `small`
+became the new 11/500 `micro`. `small` had been the app's *workhorse* — it drew
+list rows, control labels and section headings as well as units — while `micro`
+is specified only for "ticks, times, units, hosts". So one rename put most of
+the product into the smallest step in the ladder. Only the screens actively
+being rewritten were revisited afterwards; a census found **96 uses of `micro`
+against 24 of `body`**, and every ALL-CAPS heading in the product was a whisper
+when this table had said `label` all along.
+
+A design language that has to be re-chosen at 155 call sites is not implemented,
+it is merely documented. Anything with a *role* gets a function:
+
+| role | function |
+|---|---|
+| ALL-CAPS section heading | `Ui::heading` |
+| metric name + glyph | `Ui::metric_name` |
+| metric row figures | `Ui::draw_figures` |
+| chip | `Ui::chip` |
+| icon button | `Ui::icon_button` |
+| card at rest / hover / press | `Ui::card` |
+| destructive mark | `Ui::kill_glyph` |
+| checkbox | `Ui::check_box` |
+| search / filter affordance | `Ui::search_glyph` |
+
+The same rule applies to layout constants. A parallel layout formula that keeps
+its own copies of the spacing numbers *will* fall out of step: `proc_layout`
+carried a literal `52` for the metric stride, and when `ROW_METRIC` became 60
+the subprocess header moved 40 px up, landed on top of the Connections row and
+hid it — while still registering its hit first, so clicking "Processes" opened
+Connections. Layout helpers must read the same tokens the paint reads.
+
 ### Numerals
 
 Segoe UI's figures are proportional, so a value that ticks between `9.4%` and

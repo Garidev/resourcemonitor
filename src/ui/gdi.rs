@@ -362,20 +362,29 @@ impl Surface {
     }
 }
 
+/// The off-screen surface every paint draws into.
+///
+/// Deliberately **cached across paints** rather than rebuilt per frame. At
+/// 336 px wide by a window's height this DIB is close to a megabyte, and
+/// rebuilding it per paint meant allocating and freeing that much on every
+/// hover change — and once the hover cross-fade landed, up to sixty times a
+/// second. Churn on that scale is exactly what a resource monitor should not be
+/// doing. It is now rebuilt only when the window size actually changes.
 pub struct BackBuffer {
     pub dc: HDC,
     bmp: HBITMAP,
     old: HGDIOBJ,
-    target: HDC,
     bits: *mut u32,
     w: i32,
     h: i32,
 }
 
 impl BackBuffer {
-    pub fn new(target: HDC, w: i32, h: i32) -> Self {
+    /// `reference` is only used to create the compatible DC and the DIB; the
+    /// buffer does not retain it, so it may be a paint DC that expires.
+    pub fn new(reference: HDC, w: i32, h: i32) -> Self {
         unsafe {
-            let dc = CreateCompatibleDC(target);
+            let dc = CreateCompatibleDC(reference);
             let mut info: BITMAPINFO = std::mem::zeroed();
             info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
             info.bmiHeader.biWidth = w.max(1);
@@ -388,8 +397,14 @@ impl BackBuffer {
             let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
             let bmp = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
             let old = SelectObject(dc, bmp as HGDIOBJ);
-            BackBuffer { dc, bmp, old, target, bits: bits as *mut u32, w: w.max(1), h: h.max(1) }
+            BackBuffer { dc, bmp, old, bits: bits as *mut u32, w: w.max(1), h: h.max(1) }
         }
+    }
+
+    /// The size this buffer was built for, so a caller can tell whether the
+    /// cached one still fits.
+    pub fn size(&self) -> (i32, i32) {
+        (self.w, self.h)
     }
 
     /// The pixel surface behind this buffer.
@@ -405,9 +420,9 @@ impl BackBuffer {
         Some(Surface { bits: self.bits, w: self.w, h: self.h })
     }
 
-    pub fn present(&self) {
+    pub fn present(&self, target: HDC) {
         unsafe {
-            BitBlt(self.target, 0, 0, self.w, self.h, self.dc, 0, 0, SRCCOPY);
+            BitBlt(target, 0, 0, self.w, self.h, self.dc, 0, 0, SRCCOPY);
         }
     }
 }

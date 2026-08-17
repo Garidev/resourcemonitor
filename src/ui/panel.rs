@@ -254,6 +254,8 @@ pub struct Ui {
     /// state. Press is new: the panel previously gave no feedback at all
     /// between hover and whatever the click did.
     pressed: bool,
+    /// The cached off-screen buffer, rebuilt only on a size change.
+    bb: Option<BackBuffer>,
     /// Measured height of the drill-down hero plate, including the gap below
     /// it. Zero until the first paint.
     hero_h: i32,
@@ -627,6 +629,7 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         hist_net: Ring::new(60),
         surf: None,
         pressed: false,
+        bb: None,
         hero_h: 0,
         fade: None,
         fade_timer: false,
@@ -2519,7 +2522,14 @@ impl Ui {
             rc_copy = rc;
             self.notify_text_y = -1;
             self.update_edit(&rc);
-            let bb = BackBuffer::new(hdc, rc.right, rc.bottom);
+            // Reuse the cached buffer unless the window changed size. Taken out
+            // of `self` for the duration so the draw calls can hold `&mut self`.
+            let need = (rc.right.max(1), rc.bottom.max(1));
+            let bb = self
+                .bb
+                .take()
+                .filter(|b| b.size() == need)
+                .unwrap_or_else(|| BackBuffer::new(hdc, need.0, need.1));
             self.surf = bb.surface();
             gdi::fill(bb.dc, &rc, gdi::t().bg);
             self.hits.clear();
@@ -2538,7 +2548,8 @@ impl Ui {
             // Dropped before the buffer is, so no chart can hold a pointer
             // into a DIB that has been deleted.
             self.surf = None;
-            bb.present();
+            bb.present(hdc);
+            self.bb = Some(bb);
             EndPaint(hwnd, &ps);
         }
         self.place_notify_edit(&rc_copy);
@@ -2599,6 +2610,27 @@ impl Ui {
     }
 
     /// Small text button; returns the next button's right edge.
+    /// An ALL-CAPS section heading.
+    ///
+    /// One function, because the divergence between this app and its own design
+    /// spec came from letting 155 call sites each pick a font. The bulk rename
+    /// from the old four-font set mapped every 11/400 `small` to the new 11/500
+    /// `micro`, and only the places actively being rewritten were revisited — so
+    /// every heading in the product stayed a whisper when the spec had said
+    /// `label` (12/600, tracked) all along. Roles belong in functions, not in
+    /// arguments repeated a hundred and fifty times.
+    fn heading(&self, dc: HDC, x: i32, y: i32, text: &str) {
+        gdi::text_t(
+            dc,
+            x,
+            y,
+            self.fonts.label,
+            self.s(gdi::TRACK_LABEL),
+            gdi::t().dim,
+            text,
+        );
+    }
+
     /// A checkbox. Rounded frame, and when checked an accent fill carrying a
     /// tick — the old "checked" state was a smaller filled square inside a
     /// bigger one, which is a radio button's idiom, not a checkbox's.
@@ -2721,19 +2753,21 @@ impl Ui {
 
     /// Filled pill button (for save/cancel and choice chips).
     fn chip(&mut self, dc: HDC, x: i32, y: i32, label: &str, active: bool, action: Action) -> i32 {
-        let w = gdi::text_width(dc, self.fonts.micro, label) + self.s(16);
+        let w = gdi::text_width_t(dc, self.fonts.label, self.s(gdi::TRACK_LABEL), label)
+            + self.s(16);
         let r = RECT { left: x, top: y, right: x + w, bottom: y + self.ctrl_h() };
         let fill_c = if active { gdi::acc().cpu } else { gdi::t().card };
         let line_c = if active { fill_c } else { gdi::t().line };
         gdi::card(dc, &r, fill_c, line_c, self.s(RADIUS));
         // Centred rather than offset by a constant, so the label stays put if
         // the control height or the font ever changes.
-        let (asc, desc, _) = gdi::text_metrics(dc, self.fonts.micro);
-        gdi::text(
+        let (asc, desc, _) = gdi::text_metrics(dc, self.fonts.label);
+        gdi::text_t(
             dc,
             x + self.s(SP3),
             y + (self.ctrl_h() - (asc + desc)) / 2,
-            self.fonts.micro,
+            self.fonts.label,
+            self.s(gdi::TRACK_LABEL),
             if active { gdi::on(fill_c) } else { gdi::t().text },
             label,
         );
@@ -2983,7 +3017,7 @@ impl Ui {
         }
 
         // --- drives
-        gdi::text(dc, pad, y + self.s(4), self.fonts.micro, gdi::t().dim, "DRIVES");
+        self.heading(dc, pad, y + self.s(4), "DRIVES");
         y += self.s(26);
         if s.drives.is_empty() {
             gdi::text(dc, pad, y + self.s(4), self.fonts.body, gdi::t().dim, "No drives found");
@@ -3172,7 +3206,7 @@ impl Ui {
             x + self.s(8),
             y + self.s(4),
             right - self.s(8),
-            &[self.fonts.micro],
+            &[self.fonts.body, self.fonts.micro],
             gdi::t().text,
             &mcp_connect_cmd(),
         );
@@ -3606,15 +3640,17 @@ impl Ui {
 
         // Centre the title's ascent-to-baseline block in the bar, then hang
         // everything else off that baseline.
-        let (asc, desc, ilead) = gdi::text_metrics(dc, self.fonts.value);
+        let (asc, desc, ilead) = gdi::text_metrics(dc, self.fonts.title);
         let baseline = y + (h + asc - desc) / 2;
         let title_y = baseline - asc;
         // Middle of the capitals, which is what the eye reads as "centre".
         let ink_cy = baseline - (asc - ilead) / 2;
 
-        let csz = self.s(11);
+        // 14 u at 1.7, which is the spec's chevron. It was 11 at a 2 px stroke:
+        // shorter and heavier than the drawing, so it read as a chunky arrow.
+        let csz = self.s(14);
         let ccx = pad + self.s(17);
-        gdi::chevron(dc, ccx, ink_cy, csz, self.s(2), gdi::t().dim, true);
+        gdi::chevron(dc, ccx, ink_cy, csz, self.s(1).max(1) + 1, gdi::t().dim, true);
         let title_x = ccx + csz / 2 + self.s(10);
 
         // Right-hand action first: its hit must beat the bar's Back hit.
@@ -3637,7 +3673,7 @@ impl Ui {
             title_x,
             title_y,
             title_right,
-            &[self.fonts.value, self.fonts.value_sm],
+            &[self.fonts.title, self.fonts.value, self.fonts.value_sm],
             gdi::t().text,
             title,
         );
@@ -3915,15 +3951,7 @@ impl Ui {
         // Per-core grid at the top of the CPU drill-down.
         if metric == Metric::Cpu && !snap.core_pcts.is_empty() {
             let cores = snap.core_pcts.clone();
-            gdi::text_t(
-                dc,
-                pad,
-                y,
-                self.fonts.label,
-                self.s(gdi::TRACK_LABEL),
-                gdi::t().mute,
-                &format!("CPU CORES · {}", cores.len()),
-            );
+            self.heading(dc, pad, y, &format!("CPU CORES · {}", cores.len()));
             y += self.s(SP5);
             let cols: i32 = if cores.len() <= 8 { 2 } else if cores.len() <= 32 { 4 } else { 8 };
             let gap = self.s(SP3);
@@ -4452,7 +4480,7 @@ impl Ui {
                 dc,
                 pad + self.s(24),
                 y + self.s(4),
-                self.fonts.micro,
+                self.fonts.body,
                 gdi::t().text,
                 &format!("Processes ({})", subs.len()),
             );
@@ -4536,10 +4564,18 @@ impl Ui {
                         format!("{}  ·  PID {}", role, p.pid)
                     };
                     let vs = sub_value_text(p, metric);
-                    let vw = gdi::text_width(dc, self.fonts.micro, &vs);
+                    let vw = gdi::text_width(dc, self.fonts.value_sm, &vs);
                     let vx = kx - self.s(10) - vw;
-                    gdi::text_fit(dc, pad + self.s(6), ry, vx - self.s(6), &[self.fonts.micro], gdi::t().text, &title);
-                    gdi::text(dc, vx, ry, self.fonts.micro, accent_for(metric), &vs);
+                    gdi::text_fit(
+                        dc,
+                        pad + self.s(6),
+                        ry,
+                        vx - self.s(6),
+                        &[self.fonts.body, self.fonts.micro],
+                        gdi::t().text,
+                        &title,
+                    );
+                    gdi::text(dc, vx, ry, self.fonts.value_sm, accent_for(metric), &vs);
                     self.kill_glyph(dc, kx, ry);
                     let kill_hit = RECT {
                         left: kx - self.s(6),
@@ -4714,7 +4750,7 @@ impl Ui {
         }
 
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "HOW OFTEN TO UPDATE");
+        self.heading(dc, pad, y, "HOW OFTEN TO UPDATE");
         y += self.s(22);
         for (ms, label) in [
             (500u32, "Every half second — most responsive"),
@@ -4725,7 +4761,7 @@ impl Ui {
         }
 
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "THEME");
+        self.heading(dc, pad, y, "THEME");
         y += self.s(22);
         let mut x = pad;
         for (i, th) in gdi::THEMES.iter().enumerate() {
@@ -4734,7 +4770,7 @@ impl Ui {
         y += self.ctrl_row();
 
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "TEXT SIZE");
+        self.heading(dc, pad, y, "TEXT SIZE");
         y += self.s(22);
         let mut x = pad;
         for (i, (label, _)) in config::TEXT_SIZES.iter().enumerate() {
@@ -4766,7 +4802,7 @@ impl Ui {
         y += self.s(10);
         // The heading carries the shared "when" stem so each row below can
         // drop its own leading "When" and read as a continuation of it.
-        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "NOTIFY ME WHEN");
+        self.heading(dc, pad, y, "NOTIFY ME WHEN");
         y += self.s(22);
         let presets: [(u32, &str); 4] = [
             (config::NOTIFY_FINISHED, "A build or long task finishes"),
@@ -4783,7 +4819,7 @@ impl Ui {
         // heading because filing them under "notify me when" is what made the
         // input confusing in the first place.
         y += self.s(12);
-        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "CUSTOM AI REQUESTS");
+        self.heading(dc, pad, y, "CUSTOM AI REQUESTS");
         y += self.s(22);
         // Each toggles like a preset, and carries an × because unlike a preset
         // it can be removed entirely.
@@ -4830,7 +4866,7 @@ impl Ui {
         // survive a restart. Empty path means off, as it does for an alert
         // rule's file.
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "AGENT HISTORY");
+        self.heading(dc, pad, y, "AGENT HISTORY");
         y += self.s(22);
         let logging = !self.cfg.agent_log_file.trim().is_empty();
         y = self.check_row(dc, rc, y, "Also save finished agents to a file", logging, Action::ToggleAgentLog);
@@ -4855,7 +4891,7 @@ impl Ui {
 
     fn page_desktop(&mut self, dc: HDC, rc: &RECT, mut y: i32) -> i32 {
         let pad = self.s(12);
-        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "TASKBAR WIDGET");
+        self.heading(dc, pad, y, "TASKBAR WIDGET");
         y += self.s(22);
         y = self.check_row(
             dc,
@@ -4885,7 +4921,7 @@ impl Ui {
             y += self.ctrl_row();
 
             y += self.s(6);
-            gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "WIDGET THEME");
+            self.heading(dc, pad, y, "WIDGET THEME");
             y += self.s(22);
             let mut x = pad;
             for (i, th) in gdi::THEMES.iter().enumerate() {
@@ -4895,7 +4931,7 @@ impl Ui {
         }
 
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "FRAME RATE COUNTER");
+        self.heading(dc, pad, y, "FRAME RATE COUNTER");
         y += self.s(22);
         y = self.check_row(
             dc,
@@ -4921,7 +4957,7 @@ impl Ui {
         }
 
         y += self.s(10);
-        gdi::text(dc, pad, y, self.fonts.micro, gdi::t().dim, "TASKBAR TRAY ICONS");
+        self.heading(dc, pad, y, "TASKBAR TRAY ICONS");
         y += self.s(22);
         let items: [(usize, &str, bool); 6] = [
             (0, "App icon", self.cfg.tray_static),
@@ -4977,12 +5013,20 @@ impl Ui {
     fn proc_layout(&self) -> ProcLayout {
         let rows = if self.watch_has_fps() { 6 } else { 5 };
         // The metric stack, then the Connections row, then the subprocesses.
+        //
+        // These must be the *same* constants the paint uses. This formula
+        // carried a literal 52 for the metric stride; when `ROW_METRIC` became
+        // 60 the subprocess header moved 40 px up and landed on top of the
+        // Connections row, hiding it — and because its hit was registered
+        // first, clicking "Processes" opened Connections instead. A parallel
+        // layout formula with its own copies of the numbers is the bug, so
+        // there are no numbers of its own left in it.
         let y_subs_header = self.s(12)
             + self.header_height()
-            + self.s(24)
-            + rows * self.s(52)
+            + self.s(SP6)
+            + rows * self.s(ROW_METRIC)
             + self.nav_row_stride()
-            + self.s(6);
+            + self.s(SP1);
         let y_filter = y_subs_header + self.s(36);
         let y_chips = y_filter + self.s(28);
         let y_list = y_chips + self.s(28);
@@ -5029,7 +5073,7 @@ impl Ui {
         hy = self.header(dc, rc, hy, "New alert", gdi::acc().net);
         let _ = hy;
 
-        gdi::text(dc, pad, l.y_metric, self.fonts.micro, gdi::t().dim, "ALERT ME WHEN");
+        self.heading(dc, pad, l.y_metric, "ALERT ME WHEN");
         let cols = 2;
         let cell_w = (rc.right - 2 * pad - self.s(6)) / cols;
         for (i, (_, label, _)) in R_METRICS.iter().enumerate() {
@@ -5042,7 +5086,7 @@ impl Ui {
                 dc,
                 cx + self.s(8),
                 cy + self.s(3),
-                self.fonts.micro,
+                self.fonts.label,
                 if active { gdi::on(gdi::acc().cpu) } else { gdi::t().text },
                 label,
             );
