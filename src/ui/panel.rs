@@ -253,8 +253,14 @@ pub struct Ui {
     hist_cpu: Ring,
     hist_mem: Ring,
     hist_gpu: Ring,
+    /// Disk and network are two-way, so each keeps its directions apart rather
+    /// than summing them into one trace. Summed, a chart cannot show that a
+    /// machine is writing hard while reading nothing — which is most of what
+    /// makes a disk graph worth looking at.
     hist_disk: Ring,
+    hist_disk_w: Ring,
     hist_net: Ring,
+    hist_net_tx: Ring,
     /// The current paint's pixel surface, valid only between `BackBuffer::new`
     /// and `present`. Charts reach for it to write antialiased coverage; when
     /// it is `None` they fall back to an aliased `Polyline`, so a DIB that
@@ -636,7 +642,9 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         hist_mem: Ring::new(60),
         hist_gpu: Ring::new(60),
         hist_disk: Ring::new(60),
+        hist_disk_w: Ring::new(60),
         hist_net: Ring::new(60),
+        hist_net_tx: Ring::new(60),
         surf: None,
         pressed: false,
         bb: None,
@@ -682,7 +690,7 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         max_scroll: 0,
         watch: None,
         nav: NavTrail::new(16),
-        watch_rings: (0..6).map(|_| Ring::new(60)).collect(),
+        watch_rings: (0..8).map(|_| Ring::new(60)).collect(),
         draft: RuleDraft::default(),
         overlay: std::ptr::null_mut(),
         widget: std::ptr::null_mut(),
@@ -1064,8 +1072,10 @@ impl Ui {
         self.hist_cpu.push(s.cpu_pct);
         self.hist_mem.push(mem_pct);
         self.hist_gpu.push(s.gpu_pct);
-        self.hist_disk.push((s.disk_read_bps + s.disk_write_bps) as f32);
-        self.hist_net.push((s.net_rx_bps + s.net_tx_bps) as f32);
+        self.hist_disk.push(s.disk_read_bps as f32);
+        self.hist_disk_w.push(s.disk_write_bps as f32);
+        self.hist_net.push(s.net_rx_bps as f32);
+        self.hist_net_tx.push(s.net_tx_bps as f32);
         self.hist_audio.push(s.audio_peak * 100.0);
         // Advance the sticky rate ceilings exactly once per sample. Doing this
         // in the paint would decay them at the repaint rate, which hover alone
@@ -1076,8 +1086,10 @@ impl Ui {
         for (r, pct) in self.core_hist.iter_mut().zip(s.core_pcts.iter()) {
             r.push(*pct);
         }
-        self.ceil_disk.update(self.hist_disk.max());
-        self.ceil_net.update(self.hist_net.max());
+        // One ceiling per chart, covering both halves, so a symmetric burst
+        // draws symmetrically and the two halves stay comparable by eye.
+        self.ceil_disk.update(self.hist_disk.max().max(self.hist_disk_w.max()));
+        self.ceil_net.update(self.hist_net.max().max(self.hist_net_tx.max()));
         // 0 when nothing is presenting, so the graph flatlines rather than
         // holding the last frame rate of an app that has since closed.
         self.hist_fps.push(s.fps.as_ref().map(|(_, _, f)| *f as f32).unwrap_or(0.0));
@@ -1088,11 +1100,15 @@ impl Ui {
                 self.watch_rings[0].push(a.cpu);
                 self.watch_rings[1].push(a.ram_private as f32);
                 self.watch_rings[2].push(a.gpu);
-                self.watch_rings[3].push(a.disk_bps as f32);
-                self.watch_rings[4].push(a.net_bps as f32);
+                // 3 and 4 are the first direction, 6 and 7 the second, so the
+                // watch charts mirror the same way the main panel's do.
+                self.watch_rings[3].push(a.disk_read_bps as f32);
+                self.watch_rings[4].push(a.net_rx_bps as f32);
+                self.watch_rings[6].push(a.disk_write_bps as f32);
+                self.watch_rings[7].push(a.net_tx_bps as f32);
                 self.watch_rings[5].push(watch_fps(&self.snap, &name) as f32);
                 self.ceil_watch_ram.update(self.watch_rings[1].max());
-                self.ceil_watch_disk.update(self.watch_rings[3].max());
+                self.ceil_watch_disk.update(self.watch_rings[3].max().max(self.watch_rings[6].max()));
                 self.ceil_watch_net.update(self.watch_rings[4].max());
             }
         }
@@ -3065,6 +3081,22 @@ impl Ui {
                 bottom: y + self.s(44),
             };
             self.draw_figures(dc, &row, name_right, spark.left - self.s(SP3), figs);
+            // A two-way metric puts its second direction below the midline. The
+            // labels are passed but only paint where a half is tall enough for
+            // them; at row height the row's own two figures name the directions.
+            let mirror = match name.as_str() {
+                "disk" => Some(gdi::Mirror {
+                    ring: &self.hist_disk_w,
+                    label_hi: "Read",
+                    label_lo: "Write",
+                }),
+                "net" => Some(gdi::Mirror {
+                    ring: &self.hist_net_tx,
+                    label_hi: "Down",
+                    label_lo: "Up",
+                }),
+                _ => None,
+            };
             gdi::chart(
                 dc,
                 self.surf.as_ref(),
@@ -3077,6 +3109,7 @@ impl Ui {
                 None,
                 None,
                 chart_units(scale),
+                mirror,
             );
             self.hits.push((row, action));
             y += self.s(ROW_METRIC);
@@ -3870,6 +3903,22 @@ impl Ui {
             hit,
             Some(self.fonts.micro),
             chart_units(scale),
+            // The drill-down plot is the one place with room for the permanent
+            // direction labels, so this is where a two-way metric finally reads
+            // as two directions rather than one summed line.
+            match m {
+                Metric::Disk => Some(gdi::Mirror {
+                    ring: &self.hist_disk_w,
+                    label_hi: "Read",
+                    label_lo: "Write",
+                }),
+                Metric::Net => Some(gdi::Mirror {
+                    ring: &self.hist_net_tx,
+                    label_hi: "Down",
+                    label_lo: "Up",
+                }),
+                _ => None,
+            },
         );
 
         // Window and ceiling labels. The window is derived, not hardcoded —
@@ -4574,6 +4623,20 @@ impl Ui {
                 None,
                 None,
                 chart_units(scale),
+                // Disk is ring 3 paired with 6, network 4 paired with 7.
+                match ring_idx {
+                    3 => Some(gdi::Mirror {
+                        ring: &self.watch_rings[6],
+                        label_hi: "Read",
+                        label_lo: "Write",
+                    }),
+                    4 => Some(gdi::Mirror {
+                        ring: &self.watch_rings[7],
+                        label_hi: "Down",
+                        label_lo: "Up",
+                    }),
+                    _ => None,
+                },
             );
             y += self.s(ROW_METRIC);
         }

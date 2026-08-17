@@ -1163,6 +1163,18 @@ pub fn chart_hit(r: &RECT, cap: usize, held: usize, hx: i32) -> Option<usize> {
     if i < 0 || i as usize >= held { None } else { Some(i as usize) }
 }
 
+/// The second half of a two-way metric: download against upload, read against
+/// write. Drawn below the midline, sharing the primary's ceiling.
+///
+/// `label_hi` and `label_lo` are permanent direct labels — never colour alone.
+/// They name the halves so the pair does not depend on a reader noticing that
+/// one trace is a shade weaker than the other.
+pub struct Mirror<'a> {
+    pub ring: &'a Ring,
+    pub label_hi: &'a str,
+    pub label_lo: &'a str,
+}
+
 pub fn chart(
     dc: HDC,
     surf: Option<&Surface>,
@@ -1175,6 +1187,7 @@ pub fn chart(
     hover: Option<usize>,
     font_micro: Option<HFONT>,
     units: Units,
+    mirror: Option<Mirror>,
 ) {
     let cap = ring.capacity();
     let (w, h) = (r.right - r.left, r.bottom - r.top);
@@ -1184,30 +1197,34 @@ pub fn chart(
     let ceiling = ceiling.max(1.0);
     let samples: Vec<f32> = ring.iter().collect();
     let start_slot = cap.saturating_sub(samples.len());
-    let px = |i: usize| {
-        r.left as f32 + ((start_slot + i) as f32 * (w - 1) as f32) / (cap - 1) as f32
+    let px = |i: usize, start: usize| {
+        r.left as f32 + ((start + i) as f32 * (w - 1) as f32) / (cap - 1) as f32
     };
-    let py = |v: f32| {
-        r.bottom as f32 - 1.0 - (h - 2) as f32 * (v / ceiling).clamp(0.0, 1.0)
-    };
-    let base_y = r.bottom - 1;
+
+    // One quantity, two directions: the axis splits about a midline and each
+    // half gets the full ceiling, so a symmetric burst draws symmetrically.
+    // Single-series charts keep the bottom of the plot as their zero.
+    let two_way = mirror.is_some();
+    let anchor = if two_way { (r.top + r.bottom) / 2 } else { r.bottom - 1 };
+    let span = if two_way { (h / 2 - 1).max(1) } else { (h - 2).max(1) };
+    let py = |v: f32| anchor as f32 - span as f32 * (v / ceiling).clamp(0.0, 1.0);
+    let py_lo = |v: f32| anchor as f32 + span as f32 * (v / ceiling).clamp(0.0, 1.0);
 
     // 2. Un-sampled shading — the window visibly fills on first run instead of
     //    pretending the missing history was zero.
     if start_slot > 0 {
-        let shade_to = px(0).floor() as i32;
-        if shade_to > r.left {
-            let g = RECT { left: r.left, top: r.top, right: shade_to, bottom: r.bottom };
-            // A hint that the window is still filling, not a slab across it:
-            // at a half mix this read as a dark box that dominated the plot on
-            // every fresh start.
-            fill(dc, &g, mix(t().card, t().bg, 0.22));
+        let edge = px(0, start_slot).round() as i32;
+        if edge > r.left {
+            let unseen = RECT { left: r.left, top: r.top, right: edge, bottom: r.bottom };
+            fill(dc, &unseen, mix(t().card, t().grid, 0.5));
         }
     }
 
     // 3. Gridlines, gated on device height so more DPI buys more detail rather
-    //    than a more crowded box.
-    if size == ChartSize::Hero {
+    //    than a more crowded box. A mirrored chart already has a reference line
+    //    through its middle, and gridlines either side of it read as a grid of
+    //    two charts rather than one axis.
+    if size == ChartSize::Hero && !two_way {
         let fracs: &[f32] = if h >= 80 {
             &[0.25, 0.5, 0.75]
         } else if h >= 40 {
@@ -1222,50 +1239,68 @@ pub fn chart(
         }
     }
 
-    let pts: Vec<(f32, f32)> =
-        samples.iter().enumerate().map(|(i, v)| (px(i), py(*v))).collect();
+    let pts: Vec<(f32, f32)> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (px(i, start_slot), py(*v)))
+        .collect();
 
     // Crosshair, behind the trace: a rule the line crosses reads as an axis, a
     // rule drawn over it reads as damage.
     if let Some(i) = hover.filter(|i| *i < pts.len()) {
         let hx = pts[i].0.round() as i32;
-        let rule = RECT { left: hx, top: r.top, right: hx + 1, bottom: base_y };
+        let bottom = if two_way { r.bottom } else { anchor };
+        let rule = RECT { left: hx, top: r.top, right: hx + 1, bottom };
         fill(dc, &rule, t().grid);
     }
 
-    // 4. Wash: clip to the area under the trace, then one vertical gradient over
-    //    the whole plot. Because the gradient runs in screen y rather than per
-    //    column, a busy chart is luminous and a quiet one nearly bare — which is
-    //    the correct reading, and free.
-    if pts.len() >= 2 {
-        let light = luminance(t().card) > 0.5;
-        let top_f = if light { 0.20 } else { 0.26 };
+    // 4. Wash: clip to the area between the trace and the anchor, then one
+    //    vertical gradient over that half. Because the gradient runs in screen y
+    //    rather than per column, a busy chart is luminous and a quiet one nearly
+    //    bare — which is the correct reading, and free. Each half of a mirrored
+    //    chart runs its gradient *away* from the midline, so the midline is
+    //    where both fade out.
+    let light = luminance(t().card) > 0.5;
+    let top_f = if light { 0.20 } else { 0.26 };
+    let wash = |pts: &[(f32, f32)], c: u32, y_strong: i32, y_weak: i32| {
+        if pts.len() < 2 {
+            return;
+        }
         let poly: Vec<POINT> = pts
             .iter()
             .map(|(x, y)| POINT { x: x.round() as i32, y: y.round() as i32 })
             .chain([
-                POINT { x: pts[pts.len() - 1].0.round() as i32, y: base_y },
-                POINT { x: pts[0].0.round() as i32, y: base_y },
+                POINT { x: pts[pts.len() - 1].0.round() as i32, y: anchor },
+                POINT { x: pts[0].0.round() as i32, y: anchor },
             ])
             .collect();
+        let strong = mix(c, t().card, 1.0 - top_f);
+        let weak = mix(c, t().card, 0.97);
+        // GdiGradientFill wants increasing y, so the vertices are ordered
+        // top-to-bottom and the colours swap instead.
+        let (y0, c0, y1, c1) = if y_strong <= y_weak {
+            (y_strong, strong, y_weak, weak)
+        } else {
+            (y_weak, weak, y_strong, strong)
+        };
         unsafe {
             let rgn = CreatePolygonRgn(poly.as_ptr(), poly.len() as i32, WINDING as i32);
             SelectClipRgn(dc, rgn);
             let mut v = [
                 TRIVERTEX {
                     x: r.left,
-                    y: r.top,
-                    Red: chan16(mix(color, t().card, 1.0 - top_f), 0),
-                    Green: chan16(mix(color, t().card, 1.0 - top_f), 8),
-                    Blue: chan16(mix(color, t().card, 1.0 - top_f), 16),
+                    y: y0,
+                    Red: chan16(c0, 0),
+                    Green: chan16(c0, 8),
+                    Blue: chan16(c0, 16),
                     Alpha: 0,
                 },
                 TRIVERTEX {
                     x: r.right,
-                    y: r.bottom,
-                    Red: chan16(mix(color, t().card, 0.97), 0),
-                    Green: chan16(mix(color, t().card, 0.97), 8),
-                    Blue: chan16(mix(color, t().card, 0.97), 16),
+                    y: y1,
+                    Red: chan16(c1, 0),
+                    Green: chan16(c1, 8),
+                    Blue: chan16(c1, 16),
                     Alpha: 0,
                 },
             ];
@@ -1281,25 +1316,46 @@ pub fn chart(
             SelectClipRgn(dc, std::ptr::null_mut());
             DeleteObject(rgn as HGDIOBJ);
         }
+    };
+
+    // Direction is not identity: the second half is two steps of the *same* hue,
+    // not a second hue. A distinct colour would collide with the accent that
+    // already means another metric — an orange disk-write trace reads as the
+    // network — so the halves are told apart by the permanent labels below and
+    // by strength, never by hue.
+    let color_lo = mix(color, t().dim, 0.45);
+    let lo_pts: Vec<(f32, f32)> = match &mirror {
+        Some(m) => {
+            let s2: Vec<f32> = m.ring.iter().collect();
+            let start2 = cap.saturating_sub(s2.len());
+            s2.iter().enumerate().map(|(i, v)| (px(i, start2), py_lo(*v))).collect()
+        }
+        None => Vec::new(),
+    };
+
+    wash(&pts, color, r.top, anchor);
+    if two_way {
+        wash(&lo_pts, color_lo, r.bottom, anchor);
     }
 
     // 5. Baseline — always drawn, even at zero. This is what makes idle legible:
     //    a rate of 0 draws *on* the baseline, so the trace and the line coincide
     //    and the wash has no height, which is the honest picture of nothing
-    //    happening.
-    let b = RECT { left: r.left, top: base_y, right: r.right, bottom: base_y + 1 };
+    //    happening. On a mirrored chart the same line is the midline both halves
+    //    grow away from.
+    let b = RECT { left: r.left, top: anchor, right: r.right, bottom: anchor + 1 };
     fill(dc, &b, t().line);
 
-    // 6. Trace.
+    // 6. Traces.
     let width = 1.5 * scale.max(1.0);
-    match surf {
-        Some(s) => aa_polyline(s, r, &pts, width, color),
+    let trace = |p: &[(f32, f32)], c: u32| match surf {
+        Some(s) => aa_polyline(s, r, p, width, c),
         None => {
             let ip: Vec<POINT> =
-                pts.iter().map(|(x, y)| POINT { x: x.round() as i32, y: y.round() as i32 }).collect();
+                p.iter().map(|(x, y)| POINT { x: x.round() as i32, y: y.round() as i32 }).collect();
             if ip.len() >= 2 {
                 unsafe {
-                    let pen = CreatePen(PS_SOLID as i32, width.round() as i32, color);
+                    let pen = CreatePen(PS_SOLID as i32, width.round() as i32, c);
                     let old = SelectObject(dc, pen as HGDIOBJ);
                     Polyline(dc, ip.as_ptr(), ip.len() as i32);
                     SelectObject(dc, old);
@@ -1307,12 +1363,28 @@ pub fn chart(
                 }
             }
         }
+    };
+    trace(&pts, color);
+    if two_way {
+        trace(&lo_pts, color_lo);
+    }
+
+    // Permanent direct labels for the two halves — never colour alone. Gated on
+    // there being a half tall enough to hold text: at row height the label would
+    // sit on the trace, and the row's own value already names both directions.
+    if let (Some(m), Some(f)) = (&mirror, font_micro) {
+        let (asc, desc, _) = text_metrics(dc, f);
+        if span >= asc + desc + 2 {
+            text(dc, r.left + 2, r.top + 1, f, t().mute, m.label_hi);
+            text(dc, r.left + 2, r.bottom - (asc + desc) - 1, f, t().mute, m.label_lo);
+        }
     }
 
     // Peak marker: the only direct label on the plot, and it works *because*
-    // it is the only one. Suppressed when the peak is the newest sample — the
-    // head dot already says that — or when the window is flat.
-    if size == ChartSize::Hero && pts.len() > 2 {
+    // it is the only one — so a mirrored chart, which always carries two, does
+    // not get it. Suppressed when the peak is the newest sample — the head dot
+    // already says that — or when the window is flat.
+    if size == ChartSize::Hero && !two_way && pts.len() > 2 {
         let (mut pi, mut pv) = (0usize, f32::MIN);
         for (i, v) in samples.iter().enumerate() {
             if *v > pv {
@@ -1341,6 +1413,10 @@ pub fn chart(
         let rad = 3.0 * scale.max(1.0);
         aa_disc(s, r, hx, hy, rad + 1.5, t().card);
         aa_disc(s, r, hx, hy, rad, color);
+        if let Some(&(lx, ly)) = lo_pts.get(i) {
+            aa_disc(s, r, lx, ly, rad + 1.5, t().card);
+            aa_disc(s, r, lx, ly, rad, color_lo);
+        }
     }
 
     // Ceiling label, top-right — *on* the line it describes. Below the plot it
@@ -1357,6 +1433,11 @@ pub fn chart(
         let rad = 2.5 * scale.max(1.0);
         aa_disc(s, r, hx, hy, rad + 1.0, t().card);
         aa_disc(s, r, hx, hy, rad, color);
+    }
+    if let (Some(s), Some(&(hx, hy))) = (surf, lo_pts.last()) {
+        let rad = 2.5 * scale.max(1.0);
+        aa_disc(s, r, hx, hy, rad + 1.0, t().card);
+        aa_disc(s, r, hx, hy, rad, color_lo);
     }
 }
 
