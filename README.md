@@ -33,6 +33,14 @@ reads a handful of system counters at the chosen interval.
 - Per-app network usage via the `Microsoft-Windows-Kernel-Network` ETW
   provider; per-app GPU via PDH "GPU Engine" counters; per-app sound via the
   Core Audio session API (the same source as the volume mixer).
+- **Live connections**: "endpoints" in the network drill-down (or the network
+  row of any watched app) lists every open connection with the app that owns
+  it, the remote address and port, and the hostname it resolved from —
+  `Microsoft-Windows-DNS-Client` ETW events supply names *with the process
+  that asked*, which a machine-wide DNS cache dump cannot. Names fall back to
+  reverse lookups, and a row with no name says so rather than guessing.
+  Enumeration only runs while the list is open, an alert rule needs it, or an
+  AI query asks — closed, it costs nothing.
 - Right-click tray icon → Settings, "Start with Windows" (elevated Scheduled
   Task, so no UAC prompt at logon) and Exit.
 
@@ -74,6 +82,22 @@ reads a handful of system counters at the chosen interval.
   "include top apps" appends the top five processes by CPU to each log line.
   Rules are stored as `logN=` lines in `resmon.ini` (editable by hand too;
   changes there apply after restart, GUI changes apply instantly).
+
+  A rule can also watch **connections** rather than a number: pick hostname,
+  remote IP, port or app, and give it a pattern —
+
+  ```ini
+  log3=conn:host=*.asus.com; cooldown=300
+  log4=conn:port=445; file=C:\logs\smb.log
+  log5=conn:ip=204.79.
+  log6=conn:proc=mscopilot.exe
+  ```
+
+  These fire on either signal: a connection that was not open on the previous
+  tick, or a DNS lookup matching the pattern. Both are needed — polling alone
+  misses a beacon that opens and closes between two ticks, and DNS alone is
+  blind to hardcoded addresses. An armed connection rule is what keeps the
+  sweep running while the panel is closed.
 - **FPS overlay** — a floating, draggable frame counter with five colors and
   three opacity levels (settings → Desktop extras). Shows over borderless and
   windowed games; exclusive-fullscreen games bypass desktop overlays.
@@ -105,12 +129,27 @@ claude mcp add resourcemonitor "C:\Program Files\Resource Monitor\resmon-mcp.exe
 ```
 
 Tools: `system_snapshot`, `top_processes(metric, limit)`, `app_detail(name)`,
-`history` (the last ~360 samples — about 6 minutes at the default rate),
-`fps_status`, `notify(title, message)` — agents can pop a tray notification
-when a long build or task finishes — plus `notify_rules` and `report_agents`
-(below). Reads never change the system; the only writes are what an AI tells
-the app about itself. The tray app must be running, and "Allow AI tools to
-connect" must be on.
+`network_connections(...)` (below), `history` (the last ~360 samples — about
+6 minutes at the default rate), `fps_status`, `notify(title, message)` —
+agents can pop a tray notification when a long build or task finishes — plus
+`notify_rules` and `report_agents` (below). Reads never change the system; the
+only writes are what an AI tells the app about itself. The tray app must be
+running, and "Allow AI tools to connect" must be on.
+
+`network_connections` answers "what is this machine talking to, and which app
+is doing it": pid, image name, remote address and port, TCP state, and the
+hostname the address resolved from. Every filter is optional and they combine
+— `process`, `pid`, `remote_ip` (exact or a prefix like `204.79.`), `host`
+(substring or `*` wildcard), `port`, `state`, `scope`, `limit`. It defaults to
+established connections to public addresses, because unfiltered the table is
+mostly loopback and listeners.
+
+Each row says where its name came from in `name_source`: `dns_event` when the
+app was seen resolving it, `reverse` for a PTR lookup, or `null` when the name
+is simply unknown — a browser resolving over DNS-over-HTTPS bypasses the
+Windows resolver, so its rows are often unnamed. The app reports what it
+observed and leaves the judgement of whether a connection belongs there to you
+or to the assistant reading it; it ships no list of "known" endpoints.
 
 The transport is a local named pipe (`\\.\pipe\resmon-mcp`), plain-text
 commands in, one line of JSON out. Because the app runs elevated, the pipe
@@ -161,10 +200,12 @@ mixed in with what the sampler observed.
 
 ## Elevation
 
-The FPS counter and per-app network need an ETW real-time session, which
-requires running as Administrator (or membership in Performance Log Users).
-Unelevated, everything else still works and those two readouts degrade to a
-"needs administrator" hint.
+The FPS counter, per-app network and connection host names need an ETW
+real-time session, which requires running as Administrator (or membership in
+Performance Log Users). Unelevated, everything else still works and those
+readouts degrade to a "needs administrator" hint — the connection list still
+enumerates with full per-process attribution, but only reverse lookups can put
+names to addresses.
 
 ## Building
 
@@ -212,12 +253,12 @@ makensis installer/resmon.nsi
 It installs both exes into `%PROGRAMFILES%\Resource Monitor`, with optional
 desktop shortcut and autostart-task components. Pushing a `v*` tag runs the
 same steps in GitHub Actions and attaches the installer to a release, signing
-it first once the SignPath secrets are set (see `docs/signing.md`).
+it first once the SignPath secrets are set.
 
 ### Tests
 
 ```sh
-cargo test    # 60 tests, and they run on Linux too
+cargo test    # 109 tests, and they run on Linux too
 ```
 
 The parsing and bookkeeping layers — settings, alert rules, agent tracking,

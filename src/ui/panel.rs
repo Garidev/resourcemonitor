@@ -24,6 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use super::gdi::{self, BackBuffer, Fonts};
 use super::tray::{Tray, WM_APP_TRAY};
 use crate::config::{self, Settings};
+use crate::conns;
 use crate::rules;
 use crate::sampler::{ProcStat, Shared, Snapshot, WM_APP_NOTIFY, WM_APP_SNAPSHOT};
 use crate::util::{format_bytes, format_pct, format_rate, Ring};
@@ -46,7 +47,7 @@ const PINNED_STYLE: u32 =
     WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME | WS_CLIPCHILDREN;
 
 /// Rule-builder metric choices: (key, label, unit).
-const R_METRICS: [(&str, &str, &str); 8] = [
+const R_METRICS: [(&str, &str, &str); 9] = [
     ("cpu", "CPU", "%"),
     ("ram", "RAM", "%"),
     ("gpu", "GPU", "%"),
@@ -55,6 +56,14 @@ const R_METRICS: [(&str, &str, &str); 8] = [
     ("fps", "FPS", "fps"),
     ("sound", "Sound", "%"),
     ("proc", "One app…", ""),
+    ("conn", "Connection…", ""),
+];
+/// Which part of a connection a `conn` rule matches on.
+const R_CONN_FIELDS: [(rules::ConnField, &str); 4] = [
+    (rules::ConnField::Host, "hostname"),
+    (rules::ConnField::Ip, "remote IP"),
+    (rules::ConnField::Port, "port"),
+    (rules::ConnField::Process, "app"),
 ];
 const R_PROC_SUBS: [(&str, &str); 5] = [("cpu", "CPU"), ("ram", "RAM"), ("disk", "disk"), ("net", "net"), ("sound", "sound")];
 const R_COOLDOWNS: [(u64, &str); 3] = [(30, "30 seconds"), (60, "60 seconds"), (300, "5 minutes")];
@@ -91,6 +100,9 @@ enum View {
     Process,
     /// All apps currently presenting frames, with their FPS.
     FpsApps,
+    /// Live network connections: which app is talking to which endpoint.
+    /// Machine-wide, or narrowed to one app when `conns_for` is set.
+    Connections,
     /// Full list of messages received from MCP clients.
     McpMessages,
     /// What connected AI tools have reported they are working on.
@@ -142,6 +154,8 @@ enum Action {
     DraftMetric(usize),
     DraftDir(bool),
     DraftProcSub(usize),
+    /// Which part of a connection a drafted connection rule matches on.
+    DraftConnField(usize),
     DraftTop,
     /// Where a drafted alert is delivered: desktop, file, or both.
     DraftDeliver(usize),
@@ -150,6 +164,10 @@ enum Action {
     DraftCancel,
     PickApp,
     ShowFpsApps,
+    /// Open the machine-wide connection list.
+    ShowConns,
+    /// Open the connection list narrowed to the app being watched.
+    ShowAppConns,
     ClearFilter,
     ToggleAutostart,
     ToggleMcp,
@@ -184,6 +202,8 @@ struct RuleDraft {
     metric: usize,
     gt: bool,
     proc_sub: usize,
+    /// Index into R_CONN_FIELDS, for a connection rule.
+    conn_field: usize,
     /// Where the alert goes: DELIVER_DESKTOP, DELIVER_FILE or DELIVER_BOTH.
     deliver: usize,
     top: bool,
@@ -195,7 +215,15 @@ pub const DELIVER_FILE: usize = 1;
 
 impl Default for RuleDraft {
     fn default() -> Self {
-        RuleDraft { metric: 0, gt: true, proc_sub: 0, deliver: DELIVER_DESKTOP, top: true, cooldown: 1 }
+        RuleDraft {
+            metric: 0,
+            gt: true,
+            proc_sub: 0,
+            conn_field: 0,
+            deliver: DELIVER_DESKTOP,
+            top: true,
+            cooldown: 1,
+        }
     }
 }
 
@@ -214,6 +242,19 @@ pub struct Ui {
     hits: Vec<(RECT, Action)>,
     /// (image name, pids) for rows currently shown in a drill/find view.
     drawn_rows: Vec<(String, Vec<u32>)>,
+    /// Connections as of the last snapshot, already joined with process names
+    /// and resolved hostnames. Rebuilt on the tick rather than per paint,
+    /// which also happens on every mouse move.
+    conn_rows: Vec<crate::conns::Row>,
+    /// How many connections the sweep found before the view narrowed them.
+    conn_total: usize,
+    /// When that sweep ran; 0 means we have not swept since opening the view.
+    conns_swept: u64,
+    /// Narrows the connection view to one app, set when it is opened from a
+    /// watched app rather than from the network drill-down.
+    conns_for: Option<String>,
+    /// Where the back chevron goes from the connection view.
+    conns_back: View,
     fonts: Fonts,
     /// Everything is laid out in units of `scale`, so the text-size preference
     /// rides on this rather than on font heights alone — the panel grows with
@@ -265,11 +306,13 @@ pub struct Ui {
     draft: RuleDraft,
     overlay: HWND,
     widget: HWND,
-    /// (view code, rule-editor-proc-mode, subs expanded, watch has fps,
+    /// (view code, rule-editor shape, subs expanded, watch has fps,
     /// client w, client h) the EDIT children were last positioned for.
     /// Prevents hide/show churn every paint, which would steal keyboard
-    /// focus from the inputs.
-    edit_sig: (u32, bool, bool, bool, i32, i32),
+    /// focus from the inputs. The rule-editor shape covers both the chosen
+    /// metric and the connection field, because either one changes which
+    /// boxes exist and what they are asking for.
+    edit_sig: (u32, u32, bool, bool, i32, i32),
     /// Cursor position in client coords while inside the window; drives
     /// hover highlighting of clickable rows.
     hover_pos: Option<(i32, i32)>,
@@ -465,6 +508,11 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         view: View::Main,
         hits: Vec::new(),
         drawn_rows: Vec::new(),
+        conn_rows: Vec::new(),
+        conn_total: 0,
+        conns_swept: 0,
+        conns_for: None,
+        conns_back: View::Drill(Metric::Net),
         fonts,
         scale,
         dpi_scale,
@@ -493,7 +541,7 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         draft: RuleDraft::default(),
         overlay: std::ptr::null_mut(),
         widget: std::ptr::null_mut(),
-        edit_sig: (u32::MAX, false, false, false, 0, 0),
+        edit_sig: (u32::MAX, u32::MAX, false, false, 0, 0),
         hover_pos: None,
         mouse_tracking: false,
         autostart_on: false,
@@ -742,6 +790,12 @@ impl Ui {
                         // Escape steps back one level, so a settings page
                         // returns to the menu rather than leaving outright.
                         View::SettingsPage(_) => self.change_view(hwnd, View::Settings),
+                        // Likewise the connection list returns to whichever
+                        // view opened it, not all the way out.
+                        View::Connections => {
+                            let back = self.conns_back;
+                            self.change_view(hwnd, back);
+                        }
                         View::Drill(_)
                         | View::Settings
                         | View::FpsApps
@@ -812,6 +866,9 @@ impl Ui {
 
     fn on_snapshot(&mut self, hwnd: HWND) {
         self.snap = self.shared.snap.lock().unwrap().clone();
+        if matches!(self.view, View::Connections) {
+            self.refresh_conns();
+        }
         let s = &self.snap;
         let mem_pct = if s.mem_total > 0 {
             s.mem_used as f32 / s.mem_total as f32 * 100.0
@@ -1160,6 +1217,21 @@ impl Ui {
             config::save(&self.cfg);
         }
         let was_process = matches!(self.view, View::Process);
+        // The connection sweep only runs while its view is on screen. Clear
+        // the rows on the way out too, so re-opening shows "collecting"
+        // rather than a table of connections that may have closed since.
+        let entering_conns = matches!(view, View::Connections);
+        if entering_conns != matches!(self.view, View::Connections) {
+            self.shared
+                .conns_view_open
+                .store(entering_conns, Ordering::Relaxed);
+            if !entering_conns {
+                self.conn_rows.clear();
+                self.conn_total = 0;
+                self.conns_swept = 0;
+                self.conns_for = None;
+            }
+        }
         self.view = view;
         self.scroll = 0;
         self.max_scroll = 0;
@@ -1257,6 +1329,7 @@ impl Ui {
             Action::Back => {
                 let back = match self.view {
                     View::Process => self.watch_back,
+                    View::Connections => self.conns_back,
                     // Alerts are edited from their own page, so that is where
                     // saving or cancelling a rule returns to.
                     View::RuleEdit => View::SettingsPage(SettingsPage::Alerts),
@@ -1264,6 +1337,16 @@ impl Ui {
                     _ => View::Main,
                 };
                 self.change_view(hwnd, back);
+            }
+            Action::ShowConns => {
+                self.conns_for = None;
+                self.conns_back = View::Drill(Metric::Net);
+                self.change_view(hwnd, View::Connections);
+            }
+            Action::ShowAppConns => {
+                self.conns_for = self.watch.clone();
+                self.conns_back = View::Process;
+                self.change_view(hwnd, View::Connections);
             }
             Action::OpenSettings => self.change_view(hwnd, View::Settings),
             Action::OpenSettingsPage(p) => self.change_view(hwnd, View::SettingsPage(p)),
@@ -1459,11 +1542,15 @@ impl Ui {
                 self.draft.proc_sub = i;
                 unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
             }
+            Action::DraftConnField(i) => {
+                self.draft.conn_field = i;
+                unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+            }
             Action::DraftDeliver(i) => {
                 self.draft.deliver = i;
                 // The path row appears or disappears, so the EDIT children
                 // must be repositioned.
-                self.edit_sig = (u32::MAX, false, false, false, 0, 0);
+                self.edit_sig = (u32::MAX, u32::MAX, false, false, 0, 0);
                 unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
             }
             Action::DraftTop => {
@@ -1675,6 +1762,36 @@ impl Ui {
 
     fn save_draft(&mut self) -> bool {
         let (key, _, _) = R_METRICS[self.draft.metric];
+        // Delivery is decided the same way for both kinds of rule.
+        let wants_file = self.draft.deliver != DELIVER_DESKTOP;
+        let path = if wants_file { get_text(self.edit_path).trim().to_string() } else { String::new() };
+        let notify = self.draft.deliver != DELIVER_FILE;
+        if wants_file && path.is_empty() {
+            return false;
+        }
+        if key == "conn" {
+            let pattern = get_text(self.edit).trim().to_string();
+            if pattern.is_empty() {
+                return false;
+            }
+            let line = rules::build_conn_line(
+                R_CONN_FIELDS[self.draft.conn_field].0,
+                &pattern,
+                &path,
+                notify,
+                self.draft.top,
+                R_COOLDOWNS[self.draft.cooldown].0,
+            );
+            // A port that is not a number, say, is rejected here rather than
+            // saved as a rule that could never fire.
+            if rules::parse_line(&line).is_none() {
+                return false;
+            }
+            self.cfg.rule_lines.push(line);
+            self.sync_rules();
+            set_text(self.edit, "");
+            return true;
+        }
         let metric = if key == "proc" {
             let name = get_text(self.edit).trim().to_string();
             if name.is_empty() {
@@ -1687,14 +1804,6 @@ impl Ui {
         let Ok(threshold) = get_text(self.edit_val).trim().parse::<f64>() else {
             return false;
         };
-        // Desktop-only alerts ignore whatever is left in the path box.
-        let wants_file = self.draft.deliver != DELIVER_DESKTOP;
-        let path = if wants_file { get_text(self.edit_path).trim().to_string() } else { String::new() };
-        let notify = self.draft.deliver != DELIVER_FILE;
-        // "file" and "both" need somewhere to write.
-        if wants_file && path.is_empty() {
-            return false;
-        }
         let line = rules::build_line(
             &metric,
             self.draft.gt,
@@ -1839,8 +1948,13 @@ impl Ui {
     /// Idempotent: only acts when the view or client size changes — hiding
     /// and re-showing every paint would steal focus from the inputs.
     fn update_edit(&mut self, rc: &RECT) {
-        let proc_mode =
-            matches!(self.view, View::RuleEdit) && R_METRICS[self.draft.metric].0 == "proc";
+        // Both the metric and the connection field change which boxes the
+        // rule editor shows, so both belong in the signature.
+        let draft_shape = if matches!(self.view, View::RuleEdit) {
+            (self.draft.metric as u32) * 16 + self.draft.conn_field as u32
+        } else {
+            0
+        };
         let code = match self.view {
             View::Main => 0,
             View::Drill(_) => 1,
@@ -1851,11 +1965,12 @@ impl Ui {
             View::FpsApps => 5,
             View::McpMessages => 6,
             View::Activity => 7,
+            View::Connections => 8,
         };
         // subs_expanded matters because the watch view's filter box only
         // exists while the subprocess list is open; the FPS row because it
         // shifts everything below it by a row when it appears or decays away.
-        let sig = (code, proc_mode, self.subs_expanded, self.watch_has_fps(), rc.right, rc.bottom);
+        let sig = (code, draft_shape, self.subs_expanded, self.watch_has_fps(), rc.right, rc.bottom);
         if sig == self.edit_sig {
             return;
         }
@@ -1863,7 +1978,22 @@ impl Ui {
         match self.view {
             View::Main => set_cue(self.edit, "Search for an app…"),
             View::Drill(_) => set_cue(self.edit, "Filter this list…"),
-            View::RuleEdit => set_cue(self.edit, "App name, for example chrome.exe"),
+            View::Connections => set_cue(self.edit, "Filter by app, host, IP or port…"),
+            // The pattern box shares the app-name box, so the hint has to say
+            // which of the two it is asking for right now.
+            View::RuleEdit => {
+                let cue = if R_METRICS[self.draft.metric].0 == "conn" {
+                    match R_CONN_FIELDS[self.draft.conn_field].0 {
+                        rules::ConnField::Host => "Host name, for example *.asus.com",
+                        rules::ConnField::Ip => "Address or prefix, for example 204.79.",
+                        rules::ConnField::Port => "Port number, for example 445",
+                        rules::ConnField::Process => "App name, for example mscopilot.exe",
+                    }
+                } else {
+                    "App name, for example chrome.exe"
+                };
+                set_cue(self.edit, cue);
+            }
             View::Process => set_cue(self.edit, "Filter processes…"),
             _ => {}
         }
@@ -1886,7 +2016,7 @@ impl Ui {
                     ShowWindow(self.edit, SW_SHOW);
                     SetFocus(self.edit);
                 }
-                View::Drill(_) => {
+                View::Drill(_) | View::Connections => {
                     // Width leaves room for the clear × and the pause button.
                     SetWindowPos(
                         self.edit,
@@ -1915,16 +2045,33 @@ impl Ui {
                         );
                         ShowWindow(self.edit, SW_SHOW);
                     }
-                    SetWindowPos(
-                        self.edit_val,
-                        std::ptr::null_mut(),
-                        pad + self.s(70),
-                        l.y_thresh,
-                        self.s(70),
-                        self.s(18),
-                        SWP_NOZORDER,
-                    );
-                    ShowWindow(self.edit_val, SW_SHOW);
+                    if l.conn {
+                        // The pattern box: full width, since a connection rule
+                        // has no "pick" button beside it.
+                        SetWindowPos(
+                            self.edit,
+                            std::ptr::null_mut(),
+                            pad + self.s(70),
+                            l.y_name,
+                            rc.right - 2 * pad - self.s(74),
+                            self.s(18),
+                            SWP_NOZORDER,
+                        );
+                        ShowWindow(self.edit, SW_SHOW);
+                    }
+                    // The threshold box belongs to threshold rules only.
+                    if !l.conn {
+                        SetWindowPos(
+                            self.edit_val,
+                            std::ptr::null_mut(),
+                            pad + self.s(70),
+                            l.y_thresh,
+                            self.s(70),
+                            self.s(18),
+                            SWP_NOZORDER,
+                        );
+                        ShowWindow(self.edit_val, SW_SHOW);
+                    }
                     if l.file {
                         SetWindowPos(
                             self.edit_path,
@@ -1977,6 +2124,7 @@ impl Ui {
                 View::RuleEdit => self.draw_rule_edit(bb.dc, &rc),
                 View::Process => self.draw_process(bb.dc, &rc),
                 View::FpsApps => self.draw_fps_apps(bb.dc, &rc),
+                View::Connections => self.draw_conns(bb.dc, &rc),
                 View::McpMessages => self.draw_mcp_messages(bb.dc, &rc),
                 View::Activity => self.draw_activity(bb.dc, &rc),
                 View::SettingsPage(p) => self.draw_settings_page(bb.dc, &rc, p),
@@ -2989,7 +3137,21 @@ impl Ui {
             Metric::Net => ("Top apps by network use", gdi::ACC_NET),
             Metric::Audio => ("Apps playing sound", gdi::ACC_AUDIO),
         };
-        y = self.header(dc, rc, y, title, accent);
+        // The network list answers "how much"; the endpoints list answers
+        // "to whom", which is one click away rather than a separate feature.
+        y = if metric == Metric::Net {
+            self.header_ex(
+                dc,
+                rc,
+                y,
+                title,
+                accent,
+                Some(("endpoints", gdi::ACC_NET, Action::ShowConns)),
+                false,
+            )
+        } else {
+            self.header(dc, rc, y, title, accent)
+        };
 
         // Paused shows a frozen snapshot so fast-moving rows can be clicked.
         let snap = if self.paused {
@@ -3126,6 +3288,225 @@ impl Ui {
         unsafe { RestoreDC(dc, saved) };
     }
 
+    /// Join the last sweep with process names and resolved hostnames.
+    ///
+    /// Loopback is dropped: on a normal desktop it is dozens of rows of the
+    /// machine talking to itself, and it buries the answer to the question
+    /// this view exists for. The footer says so rather than leaving the count
+    /// silently short.
+    fn refresh_conns(&mut self) {
+        let table = self.shared.conns.lock().unwrap().clone();
+        self.conns_swept = table.swept_ms;
+        let process_of: HashMap<u32, String> =
+            self.snap.procs.iter().map(|p| (p.pid, p.name.clone())).collect();
+        let filter = conns::Filter {
+            process: self.conns_for.clone(),
+            scope: conns::ScopeFilter::All,
+            ..Default::default()
+        };
+        let rows: Vec<conns::Conn> = table
+            .rows
+            .into_iter()
+            .filter(|c| {
+                c.remote_ip()
+                    .map_or(false, |ip| conns::scope_of(&ip) != conns::Scope::Loopback)
+            })
+            .collect();
+        let names = self.shared.names.lock().unwrap();
+        let (rows, total) = conns::build_rows(
+            &rows,
+            &process_of,
+            &names,
+            &filter,
+            conns::MAX_LIMIT,
+        );
+        self.conn_rows = rows;
+        self.conn_total = total;
+    }
+
+    /// Text typed in the filter box, matched across everything on the row so
+    /// one box serves "edge", "asus.com", "204.79." and "443" alike.
+    fn conn_matches_filter(row: &conns::Row, filter: &str) -> bool {
+        if filter.is_empty() {
+            return true;
+        }
+        let c = &row.conn;
+        if row.process.to_lowercase().contains(filter) {
+            return true;
+        }
+        if let Some(h) = &row.host {
+            if h.contains(filter) {
+                return true;
+            }
+        }
+        if let Some((ip, port)) = &c.remote {
+            if ip.to_string().contains(filter) || port.to_string() == filter {
+                return true;
+            }
+        }
+        c.pid.to_string() == filter
+    }
+
+    fn draw_conns(&mut self, dc: HDC, rc: &RECT) {
+        let pad = self.s(12);
+        let mut y = pad;
+        let title = match &self.conns_for {
+            Some(app) => format!("{} connections", app),
+            None => "Live connections".to_string(),
+        };
+        y = self.header(dc, rc, y, &title, gdi::ACC_NET);
+
+        // Filter row, same geometry as a drill-down's but with no pause
+        // toggle: the list is already only as fast as the sweep.
+        gdi::text(dc, pad, y + self.s(5), self.fonts.small, gdi::t().dim, "Filter");
+        let top = self.filter_input_y() - self.s(3);
+        let frame = RECT {
+            left: pad + self.s(44),
+            top,
+            right: rc.right - pad,
+            bottom: top + self.ctrl_h(),
+        };
+        gdi::input_frame(dc, &frame);
+        self.clear_button(dc, &frame);
+        y += self.s(32);
+
+        if self.conns_swept == 0 {
+            gdi::text(dc, pad, y, self.fonts.normal, gdi::t().dim, "Collecting connections…");
+            return;
+        }
+
+        let filter = self.filter.clone();
+        // Taken rather than cloned: the list can be hundreds of rows and this
+        // runs on every paint, including plain mouse movement.
+        let all = std::mem::take(&mut self.conn_rows);
+        let rows: Vec<&conns::Row> =
+            all.iter().filter(|r| Self::conn_matches_filter(r, &filter)).collect();
+
+        let named = rows.iter().filter(|r| r.host.is_some()).count();
+        let summary = if self.conn_total == 0 {
+            "Nothing is connected right now".to_string()
+        } else {
+            format!("{} shown · {} named · loopback hidden", rows.len(), named)
+        };
+        gdi::text(dc, pad, y, self.fonts.small, gdi::t().dim, &summary);
+        y += self.s(18);
+        // Without the DNS provider only reverse lookups can name anything, so
+        // say why the column is thin rather than letting it read as "nothing
+        // to see here".
+        if !self.shared.etw.dns_ok.load(Ordering::Relaxed) {
+            gdi::text(
+                dc,
+                pad,
+                y,
+                self.fonts.small,
+                gdi::t().dim,
+                "Host names need administrator access.",
+            );
+            y += self.s(16);
+        }
+
+        self.drawn_rows = rows
+            .iter()
+            .map(|r| (r.process.clone(), vec![r.conn.pid]))
+            .collect();
+
+        let row_h = self.s(38);
+        let list_top = y;
+        let name_fonts = [self.fonts.normal, self.fonts.small];
+        let saved = unsafe { SaveDC(dc) };
+        unsafe { IntersectClipRect(dc, 0, list_top, rc.right, rc.bottom) };
+        for (idx, r) in rows.iter().enumerate() {
+            let ry = list_top + idx as i32 * row_h - self.scroll;
+            if ry + row_h < list_top || ry > rc.bottom - self.s(20) {
+                continue;
+            }
+            let c = &r.conn;
+            let row_bg = RECT {
+                left: pad,
+                top: ry - self.s(2),
+                right: rc.right - pad,
+                bottom: ry + row_h - self.s(6),
+            };
+            if self.hovered(&row_bg) {
+                gdi::fill(dc, &row_bg, gdi::t().card_hover);
+            }
+            // Right of the first line: the port, and its protocol when the
+            // port is one anybody would recognise.
+            let port = c.remote_port().unwrap_or(c.local_port);
+            let right = match conns::service_name(port) {
+                Some(s) => format!("{}  {}", port, s),
+                None => port.to_string(),
+            };
+            let rw = gdi::text_width(dc, self.fonts.bold_sm, &right);
+            let rx = rc.right - pad - self.s(6) - rw;
+            gdi::text(dc, rx, ry, self.fonts.bold_sm, gdi::t().text, &right);
+            gdi::text_fit(
+                dc,
+                pad + self.s(4),
+                ry,
+                rx - self.s(8),
+                &name_fonts,
+                gdi::t().text,
+                &r.process,
+            );
+
+            // Second line: what it is talking to. The name when we have one,
+            // with the address still shown on the right so the row is never
+            // only as trustworthy as the name.
+            let addr = c.remote_ip().map(|i| i.to_string()).unwrap_or_default();
+            let (left_text, right_text) = match &r.host {
+                Some(h) => (h.clone(), addr),
+                None => (addr, String::new()),
+            };
+            let sy = ry + self.s(17);
+            let mut right_edge = rc.right - pad - self.s(6);
+            if !right_text.is_empty() {
+                let w = gdi::text_width(dc, self.fonts.small, &right_text);
+                gdi::text(dc, right_edge - w, sy, self.fonts.small, gdi::t().dim, &right_text);
+                right_edge -= w + self.s(10);
+            }
+            // A state worth mentioning is one that is not simply "connected".
+            let state = conns::state_name(c.state);
+            let label = if c.proto == conns::Proto::Udp {
+                "udp".to_string()
+            } else if state == "established" {
+                String::new()
+            } else {
+                state.to_string()
+            };
+            if !label.is_empty() {
+                let w = gdi::text_width(dc, self.fonts.small, &label);
+                gdi::text(dc, right_edge - w, sy, self.fonts.small, gdi::t().dim, &label);
+                right_edge -= w + self.s(10);
+            }
+            gdi::text_fit(
+                dc,
+                pad + self.s(4),
+                sy,
+                right_edge,
+                &[self.fonts.small],
+                gdi::t().dim,
+                &left_text,
+            );
+
+            let hit = RECT {
+                left: pad,
+                top: (ry - self.s(2)).max(list_top),
+                right: rc.right - pad,
+                bottom: ry + row_h - self.s(6),
+            };
+            self.hits.push((hit, Action::Watch(idx)));
+        }
+        self.scrollbar(dc, rc, list_top, rows.len() as i32 * row_h);
+        unsafe { RestoreDC(dc, saved) };
+        drop(rows);
+        self.conn_rows = all;
+
+        if self.conn_total > 0 && self.drawn_rows.is_empty() {
+            gdi::text(dc, pad, list_top, self.fonts.normal, gdi::t().dim, "Nothing matches that filter");
+        }
+    }
+
     fn draw_process(&mut self, dc: HDC, rc: &RECT) {
         let pad = self.s(12);
         let mut y = pad;
@@ -3187,6 +3568,21 @@ impl Ui {
             };
             gdi::text_fit(dc, row.left + self.s(10), y + self.s(21), spark.left - self.s(6), &fit, gdi::t().text, &value);
             gdi::sparkline(dc, &spark, &self.watch_rings[ring_idx], max, accent);
+            // The network row is the one that has somewhere further to go:
+            // clicking it asks who this app is actually talking to.
+            if ring_idx == 4 {
+                let hint = "endpoints ›";
+                let hw = gdi::text_width(dc, self.fonts.small, hint);
+                gdi::text(
+                    dc,
+                    spark.left - self.s(10) - hw,
+                    y + self.s(6),
+                    self.fonts.small,
+                    gdi::t().dim,
+                    hint,
+                );
+                self.hits.push((row, Action::ShowAppConns));
+            }
             y += self.s(52);
         }
 
@@ -3743,12 +4139,23 @@ impl Ui {
     fn rule_edit_layout(&self) -> RuleEditLayout {
         let pad = self.s(12);
         let proc = R_METRICS[self.draft.metric].0 == "proc";
+        let conn = R_METRICS[self.draft.metric].0 == "conn";
         let y_metric = pad + self.header_height();
         let y_grid = y_metric + self.s(18);
-        let y_when = y_grid + 4 * self.s(24) + self.s(8);
+        let grid_rows = (R_METRICS.len() as i32 + 1) / 2;
+        // A connection rule has no direction and no threshold, so the row
+        // that would say "goes above" carries its field chips instead and
+        // everything below moves up by the row it does not need.
+        let y_when = y_grid + grid_rows * self.s(24) + self.s(8);
         let y_name = y_when + self.s(30);
         let y_sub = y_name + self.s(26);
-        let y_thresh = if proc { y_sub + self.s(28) } else { y_when + self.s(30) };
+        let y_thresh = if conn {
+            y_name
+        } else if proc {
+            y_sub + self.s(28)
+        } else {
+            y_when + self.s(30)
+        };
         let y_deliver = y_thresh + self.s(30);
         // The path row only exists for "file" and "both"; when it is absent
         // everything below closes up.
@@ -3756,7 +4163,7 @@ impl Ui {
         let y_file = y_deliver + self.s(28);
         let y_opts = if file { y_file + self.s(28) } else { y_deliver + self.s(30) };
         let y_buttons = y_opts + self.s(30);
-        RuleEditLayout { proc, file, y_metric, y_grid, y_when, y_name, y_sub, y_thresh, y_deliver, y_file, y_opts, y_buttons }
+        RuleEditLayout { proc, conn, file, y_metric, y_grid, y_when, y_name, y_sub, y_thresh, y_deliver, y_file, y_opts, y_buttons }
     }
 
     fn draw_rule_edit(&mut self, dc: HDC, rc: &RECT) {
@@ -3787,10 +4194,28 @@ impl Ui {
             self.hits.push((r, Action::DraftMetric(i)));
         }
 
-        gdi::text(dc, pad, l.y_when + self.s(4), self.fonts.small, gdi::t().dim, "goes");
-        let mut x = pad + self.s(40);
-        x = self.chip(dc, x, l.y_when, "above", self.draft.gt, Action::DraftDir(true));
-        self.chip(dc, x, l.y_when, "below", !self.draft.gt, Action::DraftDir(false));
+        if l.conn {
+            gdi::text(dc, pad, l.y_when + self.s(4), self.fonts.small, gdi::t().dim, "match");
+            let mut x = pad + self.s(48);
+            for (i, (_, label)) in R_CONN_FIELDS.iter().enumerate() {
+                x = self.chip(dc, x, l.y_when, label, self.draft.conn_field == i, Action::DraftConnField(i));
+            }
+            gdi::text(dc, pad, l.y_name + self.s(2), self.fonts.small, gdi::t().dim, "is");
+            gdi::input_frame(
+                dc,
+                &RECT {
+                    left: pad + self.s(66),
+                    top: l.y_name - self.s(3),
+                    right: rc.right - pad,
+                    bottom: l.y_name - self.s(3) + self.ctrl_h(),
+                },
+            );
+        } else {
+            gdi::text(dc, pad, l.y_when + self.s(4), self.fonts.small, gdi::t().dim, "goes");
+            let mut x = pad + self.s(40);
+            x = self.chip(dc, x, l.y_when, "above", self.draft.gt, Action::DraftDir(true));
+            self.chip(dc, x, l.y_when, "below", !self.draft.gt, Action::DraftDir(false));
+        }
 
         if l.proc {
             gdi::text(dc, pad, l.y_name + self.s(2), self.fonts.small, gdi::t().dim, "app");
@@ -3821,18 +4246,22 @@ impl Ui {
             }
         }
 
-        let unit = if l.proc { "" } else { R_METRICS[self.draft.metric].2 };
-        gdi::text(dc, pad, l.y_thresh + self.s(2), self.fonts.small, gdi::t().dim, "reaches");
-        gdi::input_frame(
-            dc,
-            &RECT {
-                left: pad + self.s(66),
-                top: l.y_thresh - self.s(3),
-                right: pad + self.s(144),
-                bottom: l.y_thresh - self.s(3) + self.ctrl_h(),
-            },
-        );
-        gdi::text(dc, pad + self.s(150), l.y_thresh + self.s(2), self.fonts.small, gdi::t().dim, unit);
+        // A connection rule has nothing to compare, so the threshold row is
+        // not drawn at all rather than drawn and ignored.
+        if !l.conn {
+            let unit = if l.proc { "" } else { R_METRICS[self.draft.metric].2 };
+            gdi::text(dc, pad, l.y_thresh + self.s(2), self.fonts.small, gdi::t().dim, "reaches");
+            gdi::input_frame(
+                dc,
+                &RECT {
+                    left: pad + self.s(66),
+                    top: l.y_thresh - self.s(3),
+                    right: pad + self.s(144),
+                    bottom: l.y_thresh - self.s(3) + self.ctrl_h(),
+                },
+            );
+            gdi::text(dc, pad + self.s(150), l.y_thresh + self.s(2), self.fonts.small, gdi::t().dim, unit);
+        }
 
         // Delivery is per alert. The three chips are exhaustive, which is why
         // there is no separate "optional" hint on the path row any more — that
@@ -4116,6 +4545,9 @@ fn accent_for(metric: Metric) -> u32 {
 
 struct RuleEditLayout {
     proc: bool,
+    /// Whether this is a connection rule: field chips and a pattern, in place
+    /// of the direction and threshold rows.
+    conn: bool,
     /// Whether the log-file row is shown (delivery is "file" or "both").
     file: bool,
     y_metric: i32,

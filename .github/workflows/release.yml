@@ -39,7 +39,7 @@ jobs:
   sign:
     needs: build
     runs-on: ubuntu-latest
-    # Inert until the SIGNPATH_* secrets are configured (see docs/signing.md).
+    # Inert until the SIGNPATH_* secrets are configured.
     if: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
     steps:
       - name: Download unsigned installer

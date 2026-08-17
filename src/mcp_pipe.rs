@@ -32,22 +32,9 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
-/// JSON string escaping (control chars, quotes, backslash).
-fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
+/// JSON string escaping (control chars, quotes, backslash). Shared with the
+/// connection payload builder, which is unit-tested off-Windows.
+use crate::util::json_escape as esc;
 
 use crate::util::{json_objects, json_str_field};
 
@@ -196,6 +183,51 @@ fn fresh_procs(shared: &Arc<Shared>) -> Snapshot {
     shared.snap.lock().unwrap().clone()
 }
 
+/// Force the connection sweep on and wait for one that started after this
+/// request. Unlike `fresh_procs` it cannot accept whatever is already there:
+/// a table swept before the caller asked may describe connections that have
+/// since closed, and "who is this talking to right now" has no useful answer
+/// built from stale rows.
+fn fresh_conns(shared: &Arc<Shared>) -> crate::conns::ConnTable {
+    let asked_at = unix_ms();
+    shared
+        .conns_wanted_until
+        .store(asked_at + 5000, Ordering::Relaxed);
+    for _ in 0..40 {
+        {
+            let table = shared.conns.lock().unwrap();
+            if table.swept_ms >= asked_at {
+                return table.clone();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    shared.conns.lock().unwrap().clone()
+}
+
+fn conns_json(shared: &Arc<Shared>, args: &str) -> String {
+    let (filter, limit) = crate::conns::parse_filter(args);
+    // Order matters: ask for the sweep before waiting on process data, so
+    // both land in the same tick and the pid -> name join has no gaps.
+    shared
+        .conns_wanted_until
+        .store(unix_ms() + 5000, Ordering::Relaxed);
+    let snap = fresh_procs(shared);
+    let table = fresh_conns(shared);
+    let process_of: HashMap<u32, String> =
+        snap.procs.iter().map(|p| (p.pid, p.name.clone())).collect();
+    let names = shared.names.lock().unwrap();
+    let (rows, total) =
+        crate::conns::build_rows(&table.rows, &process_of, &names, &filter, limit);
+    crate::conns::to_json(
+        &rows,
+        total,
+        shared.etw.dns_ok.load(Ordering::Relaxed),
+        table.swept_ms,
+        &filter,
+    )
+}
+
 fn handle(shared: &Arc<Shared>, hwnd: usize, req: &str) -> String {
     if !shared.mcp_enabled.load(Ordering::Relaxed) {
         return "{\"error\":\"MCP is disabled in Resource Monitor settings\"}".to_string();
@@ -290,6 +322,10 @@ fn handle(shared: &Arc<Shared>, hwnd: usize, req: &str) -> String {
             let name = parts[1..].join(" ");
             let snap = fresh_procs(shared);
             app_json(&snap, name.trim())
+        }
+        "conns" => {
+            let args = req.strip_prefix("conns").unwrap_or("").trim();
+            conns_json(shared, args)
         }
         "history" => {
             let h = shared.history.lock().unwrap();

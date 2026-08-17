@@ -127,6 +127,23 @@ mod windows {
                 }
             },
             {
+                "name": "network_connections",
+                "description": "Live network connections with the process that owns each one: pid, image name, remote address and port, TCP state, and the hostname it resolved from when the machine knows it. Answers 'what is this machine talking to, and which app is doing it'. Every filter is optional and they combine. Defaults to established connections to public addresses, which is what you usually want; pass scope 'all' to include loopback and LAN, or state 'listening' to see what is accepting connections. Each row reports name_source ('dns_event' when a DNS lookup was observed, 'reverse' for a PTR lookup, null when the name is unknown) — a null host means the name is unknown, not that the connection is anonymous. Browsers using DNS-over-HTTPS resolve names outside Windows, so their rows are often unnamed.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "process": {"type": "string", "description": "Image name, e.g. 'msedgewebview2.exe'. Supports * wildcards."},
+                        "pid": {"type": "integer", "description": "Only this process id."},
+                        "remote_ip": {"type": "string", "description": "Exact address or prefix: '204.79.' matches the whole range."},
+                        "host": {"type": "string", "description": "Substring of the resolved hostname, e.g. 'asus.com'. Supports * wildcards."},
+                        "port": {"type": "integer", "description": "Matches either end of the connection."},
+                        "state": {"type": "string", "enum": ["established", "listening", "all"], "default": "established"},
+                        "scope": {"type": "string", "enum": ["public", "local", "all"], "default": "public", "description": "'local' is loopback, LAN and link-local."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200}
+                    }
+                }
+            },
+            {
                 "name": "history",
                 "description": "Recent measurements (about 6 minutes), timestamped. Useful for spotting spikes and memory leaks.",
                 "inputSchema": {"type": "object", "properties": {}}
@@ -228,6 +245,25 @@ mod windows {
             "app_detail" => {
                 let n = args["name"].as_str().ok_or("name is required")?;
                 format!("app {}", n)
+            }
+            "network_connections" => {
+                // `key=value` pairs, tab-separated. Tabs are the delimiter, so
+                // they can never survive inside a value.
+                let mut parts: Vec<String> = Vec::new();
+                for key in ["process", "remote_ip", "host", "state", "scope"] {
+                    if let Some(v) = args[key].as_str() {
+                        let v = v.trim();
+                        if !v.is_empty() {
+                            parts.push(format!("{}={}", key, v.replace('\t', " ")));
+                        }
+                    }
+                }
+                for key in ["pid", "port", "limit"] {
+                    if let Some(v) = args[key].as_u64() {
+                        parts.push(format!("{}={}", key, v));
+                    }
+                }
+                format!("conns {}", parts.join("\t"))
             }
             "history" => "history".to_string(),
             "fps_status" => "fps".to_string(),

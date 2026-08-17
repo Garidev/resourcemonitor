@@ -124,6 +124,25 @@ pub fn cpu_pct(busy_delta: u64, total_delta: u64) -> f32 {
     ((busy_delta as f64 / total_delta as f64) * 100.0).clamp(0.0, 100.0) as f32
 }
 
+/// Escape a string for a JSON value (control characters, quotes, backslash).
+/// The app links no JSON crate on the writing side either: every response it
+/// builds has a fixed shape, so escaping is the only part that needs care.
+pub fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Pull `"key":"value"` out of a compact JSON object slice. The app links no
 /// JSON crate and the shape here is fixed and produced by our own MCP shim,
 /// so a scanner is enough — it only has to survive escapes and missing keys,

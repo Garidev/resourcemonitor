@@ -1,6 +1,6 @@
 //! 1-second sampling of system + per-process metrics via native APIs.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -105,6 +105,17 @@ pub struct Shared {
     /// Unix ms deadline until which per-process sampling is forced on
     /// (MCP queries need process data while the panel is closed).
     pub procs_wanted_until: AtomicU64,
+    /// Last connection sweep. Separate from `snap` on purpose: hundreds of
+    /// rows that only the connection views and MCP ever read.
+    pub conns: Mutex<crate::conns::ConnTable>,
+    /// Remote address -> hostname, filled by DNS-Client ETW events and by
+    /// reverse lookups. Shared with the resolver thread, hence its own Arc.
+    pub names: Arc<Mutex<crate::conns::NameMap>>,
+    /// Unix ms deadline until which the connection sweep is forced on, the
+    /// same keep-alive `procs_wanted_until` provides for process data.
+    pub conns_wanted_until: AtomicU64,
+    /// A connection view is on screen, so keep sweeping every tick.
+    pub conns_view_open: AtomicBool,
     /// Pending (title, message) notifications from MCP clients; the UI
     /// thread drains these into tray balloons.
     /// (title, message, is_mcp) — is_mcp entries also land in the Messages list.
@@ -143,6 +154,10 @@ impl Shared {
             seq: AtomicU64::new(0),
             history: Mutex::new(VecDeque::with_capacity(360)),
             procs_wanted_until: AtomicU64::new(0),
+            conns: Mutex::new(crate::conns::ConnTable::default()),
+            names: Arc::new(Mutex::new(crate::conns::NameMap::default())),
+            conns_wanted_until: AtomicU64::new(0),
+            conns_view_open: AtomicBool::new(false),
             notifications: Mutex::new(Vec::new()),
             mcp_enabled: AtomicBool::new(mcp_enabled),
             rules: Mutex::new(rules),
@@ -268,6 +283,9 @@ pub struct Sampler {
     pid_audio: HashMap<u32, f32>,
     /// Last-fired time per rule, keyed by raw rule line (survives edits).
     rule_last: HashMap<String, Instant>,
+    /// (pid, remote address, remote port) seen on the previous tick, so a
+    /// connection rule can tell a new connection from one it already reported.
+    prev_conns: HashSet<(u32, std::net::IpAddr, u16)>,
     logged_cores: bool,
 }
 
@@ -282,6 +300,7 @@ impl Sampler {
             .unwrap_or(1) as f64;
         Sampler {
             rule_last: HashMap::new(),
+            prev_conns: HashSet::new(),
             logged_cores: false,
             hwnd,
             shared,
@@ -339,6 +358,7 @@ impl Sampler {
             self.shared.rules.lock().unwrap().iter().filter(|r| r.enabled).cloned().collect();
         let need_procs = rules.iter().any(|r| r.needs_procs());
         let need_gpu = rules.iter().any(|r| r.needs_gpu());
+        let need_conns = rules.iter().any(|r| r.needs_conns());
 
         let panel_open = self.shared.panel_open.load(Ordering::Relaxed)
             || unix_ms() < self.shared.procs_wanted_until.load(Ordering::Relaxed);
@@ -361,10 +381,12 @@ impl Sampler {
         } else {
             self.prev_pids.clear();
         }
+        self.sample_conns(need_conns);
 
         if !priming {
             crate::mcp_pipe::expire_agents(&self.shared, self.hwnd);
             self.eval_rules(&rules, &snap);
+            self.eval_conn_rules(&rules, &snap);
             let mem_pct = if snap.mem_total > 0 {
                 snap.mem_used as f32 / snap.mem_total as f32 * 100.0
             } else {
@@ -407,7 +429,8 @@ impl Sampler {
     fn eval_rules(&mut self, rules: &[crate::rules::Rule], snap: &Snapshot) {
         use crate::rules::{ProcSub, RMetric};
         for rule in rules {
-            let value = match &rule.metric {
+            let Some(metric) = rule.metric() else { continue };
+            let value = match metric {
                 RMetric::Cpu => snap.cpu_pct as f64,
                 RMetric::RamPct => {
                     if snap.mem_total == 0 {
@@ -442,22 +465,122 @@ impl Sampler {
             if !rule.triggered(value) {
                 continue;
             }
-            if let Some(last) = self.rule_last.get(&rule.raw) {
-                if last.elapsed().as_secs() < rule.cooldown_s {
-                    continue;
-                }
-            }
-            if self.rule_last.len() > 64 {
-                self.rule_last.clear();
-            }
-            self.rule_last.insert(rule.raw.clone(), Instant::now());
-            write_rule_log(rule, value, snap);
-            if rule.notify {
-                let (title, body) = alert_text(rule, value, snap);
-                self.shared.notifications.lock().unwrap().push((title, body, false));
-                unsafe { PostMessageW(self.hwnd as _, WM_APP_NOTIFY, 0, 0); }
+            let (title, body) = alert_text(rule, value, snap);
+            self.fire_rule(rule, &format!("value={:.1}", value), title, body, snap);
+        }
+    }
+
+    /// Deliver one triggered rule: cooldown, log file, desktop notification.
+    /// Shared by threshold and connection rules so both obey the same
+    /// per-rule cooldown and the same delivery choices.
+    fn fire_rule(
+        &mut self,
+        rule: &crate::rules::Rule,
+        detail: &str,
+        title: String,
+        body: String,
+        snap: &Snapshot,
+    ) {
+        if let Some(last) = self.rule_last.get(&rule.raw) {
+            if last.elapsed().as_secs() < rule.cooldown_s {
+                return;
             }
         }
+        if self.rule_last.len() > 64 {
+            self.rule_last.clear();
+        }
+        self.rule_last.insert(rule.raw.clone(), Instant::now());
+        write_rule_log(rule, detail, snap);
+        if rule.notify {
+            self.shared.notifications.lock().unwrap().push((title, body, false));
+            unsafe { PostMessageW(self.hwnd as _, WM_APP_NOTIFY, 0, 0); }
+        }
+    }
+
+    /// Connection rules, which fire on either of two signals: a connection
+    /// that was not open on the previous tick, or a DNS lookup seen since it.
+    ///
+    /// Polling alone misses anything that opens and closes inside one
+    /// interval — a presence heartbeat looks exactly like that — while DNS
+    /// alone is blind to hardcoded addresses and to clients that resolve over
+    /// HTTPS. Together they cover both, and the per-rule cooldown keeps a
+    /// chatty endpoint from flooding.
+    fn eval_conn_rules(&mut self, rules: &[crate::rules::Rule], snap: &Snapshot) {
+        // Drained every tick regardless: the ETW callback keeps filling this
+        // whether or not a rule is armed to read it.
+        let events = self.shared.etw.take_dns_events();
+        let armed: Vec<&crate::rules::Rule> =
+            rules.iter().filter(|r| r.needs_conns()).collect();
+        if armed.is_empty() {
+            self.prev_conns.clear();
+            return;
+        }
+        let table = self.shared.conns.lock().unwrap().clone();
+        let process_of: HashMap<u32, String> =
+            snap.procs.iter().map(|p| (p.pid, p.name.clone())).collect();
+        let rows = {
+            let names = self.shared.names.lock().unwrap();
+            let (rows, _) = crate::conns::build_rows(
+                &table.rows,
+                &process_of,
+                &names,
+                &crate::conns::Filter {
+                    // A rule asks about a specific endpoint, so nothing is
+                    // filtered out ahead of it — including LAN and loopback,
+                    // which is the whole point of a "port 445" rule.
+                    scope: crate::conns::ScopeFilter::All,
+                    state: crate::conns::StateFilter::All,
+                    ..Default::default()
+                },
+                usize::MAX,
+            );
+            rows
+        };
+
+        // Identity of a connection for "is this new": the same app reaching
+        // the same endpoint again after it closed is worth reporting again,
+        // but the same socket seen on ten consecutive ticks is not.
+        let mut current = HashSet::with_capacity(rows.len());
+        for r in &rows {
+            if let Some((ip, port)) = r.conn.remote {
+                current.insert((r.conn.pid, ip, port));
+            }
+        }
+        let first_tick = self.prev_conns.is_empty();
+
+        for rule in &armed {
+            let Some((field, pattern)) = rule.conn() else { continue };
+            let mut hit: Option<(String, String)> = None;
+            // A lookup is the earlier signal, so it is preferred when both
+            // fire on the same tick.
+            for ev in &events {
+                let process = process_of.get(&ev.pid).cloned().unwrap_or_default();
+                if crate::rules::dns_matches(field, pattern, &ev.host, &ev.addrs, &process) {
+                    hit = Some(conn_alert_text(rule, &describe_lookup(&process, ev)));
+                    break;
+                }
+            }
+            if hit.is_none() {
+                for r in &rows {
+                    let Some((ip, port)) = r.conn.remote else { continue };
+                    // On the first tick after arming, everything already open
+                    // would look new; reporting a hundred existing
+                    // connections at once is noise, not an alert.
+                    if first_tick || self.prev_conns.contains(&(r.conn.pid, ip, port)) {
+                        continue;
+                    }
+                    if crate::rules::conn_matches(field, pattern, r) {
+                        hit = Some(conn_alert_text(rule, &describe_conn(r)));
+                        break;
+                    }
+                }
+            }
+            if let Some((title, body)) = hit {
+                let detail = body.clone();
+                self.fire_rule(rule, &detail, title, body, snap);
+            }
+        }
+        self.prev_conns = current;
     }
 
     fn sample_cpu(&mut self, snap: &mut Snapshot) {
@@ -623,6 +746,31 @@ impl Sampler {
         snap.core_pcts = pcts;
     }
 
+    /// Enumerate live connections, but only while something is looking: a
+    /// connection view is open, or an MCP request has asked within the last
+    /// few seconds. Idle with the panel closed, this does nothing at all.
+    ///
+    /// The stale table is cleared rather than left behind, so a view opening
+    /// later never shows connections from minutes ago as if they were live.
+    fn sample_conns(&mut self, need_conns: bool) {
+        let wanted = need_conns
+            || self.shared.conns_view_open.load(Ordering::Relaxed)
+            || unix_ms() < self.shared.conns_wanted_until.load(Ordering::Relaxed);
+        if !wanted {
+            let mut table = self.shared.conns.lock().unwrap();
+            if !table.rows.is_empty() {
+                *table = crate::conns::ConnTable::default();
+            }
+            return;
+        }
+        let rows = crate::conns::sweep();
+        // Anything public we have no name for yet gets queued for a PTR
+        // lookup; the worker answers off-thread and the next sweep picks it up.
+        crate::conns::queue_reverse_lookups(&rows, &self.shared.names);
+        *self.shared.conns.lock().unwrap() =
+            crate::conns::ConnTable { rows, swept_ms: unix_ms() };
+    }
+
     fn sample_processes(&mut self, snap: &mut Snapshot, elapsed: f64) {
         if !self.query_process_buffer() {
             return;
@@ -727,10 +875,44 @@ pub fn local_timestamp() -> String {
     )
 }
 
+/// One line describing a connection, for the alert and the log: who, where,
+/// and the address behind the name so the name is never the only evidence.
+fn describe_conn(row: &crate::conns::Row) -> String {
+    let app = if row.process.is_empty() { "an app".to_string() } else { row.process.clone() };
+    let endpoint = match (&row.host, row.conn.remote) {
+        (Some(h), Some((ip, port))) => format!("{} ({}:{})", h, ip, port),
+        (None, Some((ip, port))) => format!("{}:{}", ip, port),
+        _ => "an endpoint".to_string(),
+    };
+    format!("{} connected to {}", app, endpoint)
+}
+
+/// The same, for a rule that fired on a name lookup rather than a socket.
+fn describe_lookup(process: &str, ev: &crate::etw::DnsEvent) -> String {
+    let app = if process.is_empty() { "an app".to_string() } else { process.to_string() };
+    let addrs: Vec<String> = ev.addrs.iter().take(2).map(|a| a.to_string()).collect();
+    if addrs.is_empty() {
+        format!("{} looked up {}", app, ev.host)
+    } else {
+        format!("{} looked up {} ({})", app, ev.host, addrs.join(", "))
+    }
+}
+
+fn conn_alert_text(rule: &crate::rules::Rule, what: &str) -> (String, String) {
+    let title = match rule.conn() {
+        Some((field, pattern)) => format!("Alert: {} matches {}", field.label(), pattern),
+        None => "Alert: connection".to_string(),
+    };
+    (title, format!("{}.", what))
+}
+
 fn alert_text(rule: &crate::rules::Rule, value: f64, snap: &Snapshot) -> (String, String) {
     use crate::rules::{ProcSub, RMetric};
+    let Some(metric) = rule.metric() else {
+        return conn_alert_text(rule, "a matching connection appeared");
+    };
     // Friendly name + unit + a nicely formatted value for this metric.
-    let (name, unit, shown) = match &rule.metric {
+    let (name, unit, shown) = match metric {
         RMetric::Cpu => ("CPU".to_string(), "%", format!("{:.0}%", value)),
         RMetric::RamPct => ("RAM".to_string(), "%", format!("{:.0}%", value)),
         RMetric::Gpu => ("GPU".to_string(), "%", format!("{:.0}%", value)),
@@ -749,8 +931,12 @@ fn alert_text(rule: &crate::rules::Rule, value: f64, snap: &Snapshot) -> (String
             (format!("{} {}", name, label), "", shown)
         }
     };
-    let dir = if rule.gt { "above" } else { "below" };
-    let threshold = format!("{}{}", (rule.threshold as i64), unit);
+    let (gt, threshold_value) = match &rule.cond {
+        crate::rules::Cond::Threshold { gt, threshold, .. } => (*gt, *threshold),
+        crate::rules::Cond::Conn { .. } => (true, 0.0),
+    };
+    let dir = if gt { "above" } else { "below" };
+    let threshold = format!("{}{}", (threshold_value as i64), unit);
     let title = format!("Alert: {} {} {}", name, dir, threshold);
     let mut body = format!("{} reached {}.", name, shown);
     if !snap.procs.is_empty() {
@@ -763,12 +949,15 @@ fn alert_text(rule: &crate::rules::Rule, value: f64, snap: &Snapshot) -> (String
     (title, body)
 }
 
-fn write_rule_log(rule: &crate::rules::Rule, value: f64, snap: &Snapshot) {
+/// `detail` is what the rule observed: "value=93.2" for a threshold, or a
+/// sentence for a connection rule. Threshold lines keep the exact shape they
+/// have always had, so anything parsing existing logs still works.
+fn write_rule_log(rule: &crate::rules::Rule, detail: &str, snap: &Snapshot) {
     use std::io::Write;
     if rule.file.trim().is_empty() {
         return; // notify-only rule
     }
-    let mut line = format!("[{}] value={:.1} (rule: {})", local_timestamp(), value, rule.raw);
+    let mut line = format!("[{}] {} (rule: {})", local_timestamp(), detail, rule.raw);
     if rule.top && !snap.procs.is_empty() {
         let mut by_cpu: Vec<&ProcStat> = snap.procs.iter().collect();
         by_cpu.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));

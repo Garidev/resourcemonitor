@@ -4,6 +4,7 @@
 
 mod agents;
 mod config;
+mod conns;
 mod util;
 
 #[cfg(windows)]
@@ -140,6 +141,11 @@ fn main() {
 
         let etw_shared = shared.clone();
         std::thread::spawn(move || etw::run(etw_shared));
+
+        // Reverse-DNS worker: idle until a connection sweep queues an address
+        // it has no name for. Started here because PTR lookups can block for
+        // seconds and must never sit on the sampler or pipe thread.
+        conns::start_reverse_resolver(shared.names.clone());
 
         let hwnd_num = hwnd as usize;
         let sampler_shared = shared.clone();

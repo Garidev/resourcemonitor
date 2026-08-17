@@ -1,6 +1,8 @@
-//! One real-time ETW session feeding two features:
+//! One real-time ETW session feeding three features:
 //!  - Microsoft-Windows-DXGI Present events  -> per-process presents/sec (FPS)
 //!  - Microsoft-Windows-Kernel-Network       -> per-process sent/recv bytes
+//!  - Microsoft-Windows-DNS-Client           -> address -> hostname, with the
+//!    pid that asked (the connection views join on this)
 //!
 //! Requires elevation (or membership in Performance Log Users). On failure we
 //! set `ok = false` and the UI degrades gracefully.
@@ -20,6 +22,7 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
 const SESSION_NAME: &str = "ResMonTrace";
 const ERROR_ALREADY_EXISTS: u32 = 183;
 const TRACE_LEVEL_VERBOSE: u8 = 5;
+const TRACE_LEVEL_INFORMATION: u8 = 4;
 
 // Microsoft-Windows-DXGI {CA11C036-0102-4A2D-A6AD-F03CFED5D3C9}
 const DXGI_PROVIDER: GUID = GUID {
@@ -44,15 +47,47 @@ const KNET_RECV: [u16; 3] = [11, 27, 43];
 const KNET_SEND6: u16 = 58;
 const KNET_RECV6: u16 = 59;
 
+// Microsoft-Windows-DNS-Client {1C95126E-7EEA-49A9-A3FE-A378B03DDB4D}.
+// Emitted inside the process that called the resolver, so the event header
+// carries the pid that wanted the name — the attribution a machine-wide DNS
+// cache dump cannot give.
+const DNS_PROVIDER: GUID = GUID {
+    data1: 0x1C95126E,
+    data2: 0x7EEA,
+    data3: 0x49A9,
+    data4: [0xA3, 0xFE, 0xA3, 0x78, 0xB0, 0x3D, 0xDB, 0x4D],
+};
+// DNS_QUERY_COMPLETED: name, type, options, status, results.
+const DNS_EVENT_QUERY_COMPLETED: u16 = 3008;
+
+/// One observed name lookup: what was asked for, what it resolved to, and
+/// which process asked. Connection alert rules read these.
+#[derive(Clone, Debug)]
+pub struct DnsEvent {
+    pub pid: u32,
+    pub host: String,
+    pub addrs: Vec<std::net::IpAddr>,
+}
+
+/// Lookups are kept only until the next sampler tick reads them. The cap is
+/// a backstop for the case where nothing is draining — a burst of lookups
+/// must not grow this without bound.
+const DNS_EVENT_CAP: usize = 256;
+
 pub struct EtwShared {
     pub ok: AtomicBool,
     /// True only when the Kernel-Network provider actually enabled — the
     /// per-app network hint shows only when this is false.
     pub knet_ok: AtomicBool,
+    /// True when the DNS-Client provider enabled. False means connections can
+    /// still be listed, but only reverse lookups can name them.
+    pub dns_ok: AtomicBool,
     /// pid -> Present-event count since last drain.
     pub presents: Mutex<HashMap<u32, u32>>,
     /// pid -> (sent bytes, received bytes) since last drain.
     pub net: Mutex<HashMap<u32, (u64, u64)>>,
+    /// Name lookups seen since the last drain, oldest first.
+    pub dns_events: Mutex<Vec<DnsEvent>>,
 }
 
 impl EtwShared {
@@ -60,9 +95,18 @@ impl EtwShared {
         EtwShared {
             ok: AtomicBool::new(false),
             knet_ok: AtomicBool::new(false),
+            dns_ok: AtomicBool::new(false),
             presents: Mutex::new(HashMap::new()),
             net: Mutex::new(HashMap::new()),
+            dns_events: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Take everything seen since the last call. Callers drain every tick
+    /// whether or not they have a use for the events, so the queue never
+    /// accumulates.
+    pub fn take_dns_events(&self) -> Vec<DnsEvent> {
+        std::mem::take(&mut *self.dns_events.lock().unwrap())
     }
 }
 
@@ -118,6 +162,26 @@ unsafe extern "system" fn on_event(rec: *mut EVENT_RECORD) {
             e.0 += size;
         } else {
             e.1 += size;
+        }
+    } else if guid_eq(provider, &DNS_PROVIDER) {
+        if id != DNS_EVENT_QUERY_COMPLETED || r.UserData.is_null() {
+            return;
+        }
+        let payload = std::slice::from_raw_parts(r.UserData as *const u8, r.UserDataLength as usize);
+        // A payload we cannot decode costs one dropped name, never a crash:
+        // every read in the parser is bounds-checked.
+        let Some((host, ips)) = crate::conns::parse_dns_query_event(payload) else { return };
+        let pid = r.EventHeader.ProcessId;
+        let now = crate::sampler::unix_ms();
+        {
+            let mut names = shared.names.lock().unwrap();
+            for ip in &ips {
+                names.insert(*ip, &host, crate::conns::NameSource::DnsEvent, Some(pid), now);
+            }
+        }
+        let mut queue = shared.etw.dns_events.lock().unwrap();
+        if queue.len() < DNS_EVENT_CAP {
+            queue.push(DnsEvent { pid, host, addrs: ips });
         }
     }
 }
@@ -184,12 +248,19 @@ pub fn run(shared: Arc<crate::sampler::Shared>) {
         }
 
         let mut enabled = 0;
-        for (provider, pname) in [(&DXGI_PROVIDER, "DXGI"), (&KNET_PROVIDER, "Kernel-Network")] {
+        // DNS-Client is enabled at Information rather than Verbose: query
+        // completions are Information-level, and Verbose would additionally
+        // subscribe this session to the resolver's debug traffic for nothing.
+        for (provider, pname, level) in [
+            (&DXGI_PROVIDER, "DXGI", TRACE_LEVEL_VERBOSE),
+            (&KNET_PROVIDER, "Kernel-Network", TRACE_LEVEL_VERBOSE),
+            (&DNS_PROVIDER, "DNS-Client", TRACE_LEVEL_INFORMATION),
+        ] {
             let rc = EnableTraceEx2(
                 session,
                 provider,
                 EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                TRACE_LEVEL_VERBOSE,
+                level,
                 u64::MAX, // match any keyword; keyword-less events always pass
                 0,
                 0,
@@ -201,6 +272,9 @@ pub fn run(shared: Arc<crate::sampler::Shared>) {
                 enabled += 1;
                 if pname == "Kernel-Network" {
                     shared.etw.knet_ok.store(true, Ordering::Relaxed);
+                }
+                if pname == "DNS-Client" {
+                    shared.etw.dns_ok.store(true, Ordering::Relaxed);
                 }
             }
         }
