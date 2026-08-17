@@ -84,6 +84,16 @@ pub enum Metric {
     Audio,
 }
 
+/// What a hero plot is charting. FPS is deliberately not a `Metric` — it has no
+/// per-app drill-down of the same shape, its own list view, and no place in the
+/// metric ordering — but it has a history ring like the rest, so the plot takes
+/// this instead of a `Metric` and FPS gets the same graph everything else has.
+#[derive(Clone, Copy, PartialEq)]
+enum Hero {
+    M(Metric),
+    Fps,
+}
+
 /// Settings categories, grouped by what they affect.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
@@ -720,7 +730,7 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         max_scroll: 0,
         watch: None,
         nav: NavTrail::new(16),
-        watch_rings: (0..8).map(|_| Ring::new(60)).collect(),
+        watch_rings: (0..9).map(|_| Ring::new(60)).collect(),
         draft: RuleDraft::default(),
         overlay: std::ptr::null_mut(),
         widget: std::ptr::null_mut(),
@@ -1114,6 +1124,24 @@ impl Ui {
         } else {
             0.0
         };
+        // While the graph is frozen the display rings do not advance, so a peak
+        // stays where it is instead of sliding out from under the cursor. Frozen
+        // means either the pause button is on or the pointer is over the plot.
+        //
+        // Only the rings stop. Alerts, the MCP server, the tray icons and the
+        // tooltip all read the snapshot directly, so nothing that matters is
+        // paused — this holds the picture, not the monitoring.
+        let over_plot = matches!(self.view, View::Drill(_) | View::FpsApps)
+            && self.hover_pos.is_some_and(|(x, y)| {
+                let p = self.hero_plot;
+                x >= p.left && x < p.right && y >= p.top && y < p.bottom
+            });
+        let frozen = self.paused || over_plot;
+
+        // Only the display rings and their ceilings are inside this guard. The
+        // tray icons, overlay, widget and relayout below it keep running, so a
+        // frozen graph never means a frozen tray.
+        if !frozen {
         self.hist_cpu.push(s.cpu_pct);
         self.hist_mem.push(mem_pct);
         self.hist_gpu.push(s.gpu_pct);
@@ -1158,12 +1186,14 @@ impl Ui {
                 self.watch_rings[6].push(a.disk_write_bps as f32);
                 self.watch_rings[7].push(a.net_tx_bps as f32);
                 self.watch_rings[5].push(watch_fps(&self.snap, &name) as f32);
+                self.watch_rings[8].push(a.audio * 100.0);
                 self.ceil_watch_ram.update(self.watch_rings[1].max());
                 self.ceil_watch_disk.update(self.watch_rings[3].max());
-        self.ceil_watch_disk_w.update(self.watch_rings[6].max());
-        self.ceil_watch_net_tx.update(self.watch_rings[7].max());
+                self.ceil_watch_disk_w.update(self.watch_rings[6].max());
+                self.ceil_watch_net_tx.update(self.watch_rings[7].max());
                 self.ceil_watch_net.update(self.watch_rings[4].max());
             }
+        }
         }
 
         let mut tip = format!(
@@ -2109,9 +2139,13 @@ impl Ui {
                 // Turn the click's x back into a sample. Clicking the sample
                 // that is already pinned unpins it, so the same gesture undoes
                 // itself rather than needing somewhere else to click.
-                let View::Drill(m) = self.view else { return };
+                let hero = match self.view {
+                    View::Drill(m) => Hero::M(m),
+                    View::FpsApps => Hero::Fps,
+                    _ => return,
+                };
                 let (cap, held) = {
-                    let (ring, _, _, _) = self.hero_series(m);
+                    let (ring, _, _, _) = self.hero_series(hero);
                     (ring.capacity(), ring.iter().count())
                 };
                 let plot = self.hero_plot;
@@ -3886,15 +3920,16 @@ impl Ui {
         if self.hero_h > 0 { self.hero_h } else { self.s(HERO_H_GUESS + SP4) }
     }
 
-    /// The ring, accent and scale behind a metric's hero chart.
-    fn hero_series(&self, m: Metric) -> (&Ring, u32, Scale, &'static str) {
-        match m {
-            Metric::Cpu => (&self.hist_cpu, gdi::acc().cpu, Scale::Percent, "Processor"),
-            Metric::Ram => (&self.hist_mem, gdi::acc().ram, Scale::Percent, "Memory"),
-            Metric::Gpu => (&self.hist_gpu, gdi::acc().gpu, Scale::Percent, "Graphics"),
-            Metric::Disk => (&self.hist_disk, gdi::acc().disk, Scale::Rate, "Disk"),
-            Metric::Net => (&self.hist_net, gdi::acc().net, Scale::Rate, "Network"),
-            Metric::Audio => (&self.hist_audio, gdi::acc().audio, Scale::Percent, "Sound"),
+    /// The ring, accent and scale behind a hero chart.
+    fn hero_series(&self, h: Hero) -> (&Ring, u32, Scale, &'static str) {
+        match h {
+            Hero::Fps => (&self.hist_fps, gdi::acc().fps, Scale::Fps, "Frame rate"),
+            Hero::M(Metric::Cpu) => (&self.hist_cpu, gdi::acc().cpu, Scale::Percent, "Processor"),
+            Hero::M(Metric::Ram) => (&self.hist_mem, gdi::acc().ram, Scale::Percent, "Memory"),
+            Hero::M(Metric::Gpu) => (&self.hist_gpu, gdi::acc().gpu, Scale::Percent, "Graphics"),
+            Hero::M(Metric::Disk) => (&self.hist_disk, gdi::acc().disk, Scale::Rate, "Disk"),
+            Hero::M(Metric::Net) => (&self.hist_net, gdi::acc().net, Scale::Rate, "Network"),
+            Hero::M(Metric::Audio) => (&self.hist_audio, gdi::acc().audio, Scale::Percent, "Sound"),
         }
     }
 
@@ -3904,7 +3939,7 @@ impl Ui {
     ///
     /// The age is relative on purpose. `23s ago` answers the question a monitor
     /// is asked; `14:22:07` does not.
-    fn draw_hero(&mut self, dc: HDC, rc: &RECT, y: i32, m: Metric) -> i32 {
+    fn draw_hero(&mut self, dc: HDC, rc: &RECT, y: i32, h: Hero) -> i32 {
         let pad = self.s(SP4);
         // Everything below is laid out from measured text, so the plate is
         // exactly as tall as its contents need and the plot cannot escape it.
@@ -3915,7 +3950,7 @@ impl Ui {
         let plot_h = self.s(HERO_PLOT_H);
         // Disk and Network carry a second figure under the first, so the plate
         // is a line taller for them.
-        let two_way = matches!(m, Metric::Disk | Metric::Net);
+        let two_way = matches!(h, Hero::M(Metric::Disk) | Hero::M(Metric::Net));
         let second_line = if two_way { self.s(SP1) + (m_asc + m_desc) } else { 0 };
         let plate_h = head_h
             + second_line
@@ -3940,7 +3975,7 @@ impl Ui {
         // drawing: `held` comes from a scoped borrow so the pin can be dropped
         // and the hit registered without holding a reference across either.
         let held = {
-            let (ring, _, _, _) = self.hero_series(m);
+            let (ring, _, _, _) = self.hero_series(h);
             ring.iter().count()
         };
         // A pin that has scrolled off the left of the window is dropped, which
@@ -3952,9 +3987,11 @@ impl Ui {
         self.hero_plot = plot;
         self.hits.push((plot, Action::PinHero));
 
-        let (ring, accent, scale, kind) = self.hero_series(m);
+        let (ring, accent, scale, kind) = self.hero_series(h);
         let cap = ring.capacity();
-        let sticky = if m == Metric::Disk { &self.ceil_disk } else { &self.ceil_net };
+        // Only the rate scales consult a sticky ceiling; percent and FPS resolve
+        // from the scale alone, so which one is passed for them is immaterial.
+        let sticky = if h == Hero::M(Metric::Disk) { &self.ceil_disk } else { &self.ceil_net };
         let ceiling = scale.ceiling(ring.max(), sticky);
         let latest = ring.iter().last().unwrap_or(0.0);
 
@@ -3974,14 +4011,14 @@ impl Ui {
         // halves of the chart rather than only the half that happens to be on
         // top. Read straight from the mirrored ring, so the two figures always
         // describe the same instant.
-        let second: Option<(f32, &'static str, u32)> = match m {
-            Metric::Disk => Some((
+        let second: Option<(f32, &'static str, u32)> = match h {
+            Hero::M(Metric::Disk) => Some((
                 hit.and_then(|i| self.hist_disk_w.iter().nth(i))
                     .unwrap_or_else(|| self.hist_disk_w.iter().last().unwrap_or(0.0)),
                 "write",
                 gdi::acc().disk_w,
             )),
-            Metric::Net => Some((
+            Hero::M(Metric::Net) => Some((
                 hit.and_then(|i| self.hist_net_tx.iter().nth(i))
                     .unwrap_or_else(|| self.hist_net_tx.iter().last().unwrap_or(0.0)),
                 "up",
@@ -3989,9 +4026,9 @@ impl Ui {
             )),
             _ => None,
         };
-        let primary_unit = match m {
-            Metric::Disk => Some("read"),
-            Metric::Net => Some("down"),
+        let primary_unit = match h {
+            Hero::M(Metric::Disk) => Some("read"),
+            Hero::M(Metric::Net) => Some("down"),
             _ => None,
         };
 
@@ -3999,7 +4036,11 @@ impl Ui {
         let age = match hit {
             Some(i) => {
                 let back = held.saturating_sub(1).saturating_sub(i) as u32;
-                if back == 0 { "now".to_string() } else { format!("{}s ago", back * interval / 1000) }
+                if back == 0 {
+                    "now".to_string()
+                } else {
+                    format!("\u{2212}{}s", back * interval / 1000)
+                }
             }
             None => "now".to_string(),
         };
@@ -4055,7 +4096,7 @@ impl Ui {
         // pinned sample keeps changing and the reading does not — saying "23s
         // ago" next to a figure frozen at 14s ago would be a lie that grows.
         let right_label = if hovered.is_none() && self.pin_back.is_some() {
-            format!("pinned · {}", age)
+            format!("{} · pinned", age)
         } else {
             age.clone()
         };
@@ -4084,15 +4125,15 @@ impl Ui {
             // The drill-down plot is the one place with room for the permanent
             // direction labels, so this is where a two-way metric finally reads
             // as two directions rather than one summed line.
-            match m {
-                Metric::Disk => Some(gdi::Mirror {
+            match h {
+                Hero::M(Metric::Disk) => Some(gdi::Mirror {
                     ring: &self.hist_disk_w,
                     label_hi: "Read",
                     label_lo: "Write",
                     color: gdi::acc().disk_w,
                     ceiling: self.ceil_disk_w.peek(),
                 }),
-                Metric::Net => Some(gdi::Mirror {
+                Hero::M(Metric::Net) => Some(gdi::Mirror {
                     ring: &self.hist_net_tx,
                     label_hi: "Down",
                     label_lo: "Up",
@@ -4176,15 +4217,17 @@ impl Ui {
             Metric::Audio => ("Apps playing sound", gdi::acc().audio),
         };
         y = self.header(dc, rc, y, title, accent);
-        // The network list answers "how much"; the connections list answers
-        // "to whom". It gets a row of its own directly above the filter
-        // rather than a word tucked into the header, where it read as
-        // decoration and was easy to miss.
-        if metric == Metric::Net {
-            y = self.nav_row(dc, rc, y, "Connections", Action::ShowConns);
-        }
+        y = self.draw_hero(dc, rc, y, Hero::M(metric));
 
-        y = self.draw_hero(dc, rc, y, metric);
+        // The network list answers "how much"; the connections list answers
+        // "to whom". It gets a row of its own rather than a word tucked into the
+        // header, where it read as decoration and was easy to miss. Below the
+        // graph and above the filter: the graph belongs to the header it
+        // describes, and a nav row wedged between the two separated them.
+        // `filter_input_y` already accounts for both, so the sum is unchanged.
+        if metric == Metric::Net {
+            y = self.nav_row(dc, rc, y, "Network connections", Action::ShowConns);
+        }
 
         // Paused shows a frozen snapshot so fast-moving rows can be clicked.
         let snap = if self.paused {
@@ -4487,8 +4530,8 @@ impl Ui {
     fn draw_conns(&mut self, dc: HDC, rc: &RECT) {
         let pad = self.s(12);
         let title = match &self.conns_for {
-            Some(app) => format!("{} connections", app),
-            None => "Live connections".to_string(),
+            Some(app) => format!("{} network connections", app),
+            None => "Live network connections".to_string(),
         };
         // The y the header hands back is deliberately dropped: the filter frame
         // below is placed from `filter_input_y()`, and everything under it is
@@ -4758,6 +4801,23 @@ impl Ui {
             3,
             Scale::Rate,
         ));
+        // Sound, when the app is actually playing something. Reported as the
+        // level rather than as a count: "2 playing" answers a question about the
+        // machine, and this view is about one app.
+        if a.audio > 0.01 || self.watch_rings[8].max() > 0.0 {
+            rows.push((
+                "Sound",
+                gdi::acc().audio,
+                gdi::Glyph::Audio,
+                if a.audio > 0.01 {
+                    Figures::new(format_pct(a.audio * 100.0))
+                } else {
+                    Figures::new("Silent".to_string())
+                },
+                8,
+                Scale::Percent,
+            ));
+        }
         rows.push((
             "Network",
             gdi::acc().net,
@@ -4833,7 +4893,7 @@ impl Ui {
         // mean sweeping forever behind a screen nobody is looking at.
         // The subprocess block below re-anchors from `proc_layout`, which
         // accounts for this row, so the returned y is deliberately dropped.
-        self.nav_row(dc, rc, y, "Connections", Action::ShowAppConns);
+        self.nav_row(dc, rc, y, "Network connections", Action::ShowAppConns);
 
         // --- subprocesses: collapsed by default (a browser can be 70+ rows).
         // Expand for the individual processes, labelled by role where the
@@ -5007,6 +5067,12 @@ impl Ui {
             gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "Frame rate tracking needs administrator access.");
             return;
         }
+        // The same plot every other metric gets, above the per-app list, which is
+        // unchanged. Drawn after the ETW check, because without the provider
+        // there is no frame data at all and an empty axis would be furniture
+        // pretending to be a reading. Drawn *before* the empty-list check on
+        // purpose: with nothing presenting, a flatline is the answer.
+        y = self.draw_hero(dc, rc, y, Hero::Fps);
         if self.snap.fps_list.is_empty() {
             gdi::text(dc, pad, y, self.fonts.body, gdi::t().dim, "Nothing on screen");
             return;
@@ -6023,6 +6089,10 @@ struct AppSums {
     net_bps: u64,
     net_rx_bps: u64,
     net_tx_bps: u64,
+    /// Loudest stream among this app's processes, 0..1. Summed would be wrong —
+    /// six Chrome renderers at 0.4 are not 240 % of anything — so the app's level
+    /// is the loudest thing it is playing.
+    audio: f32,
 }
 
 /// Highest FPS among this app's processes (0 when it isn't presenting).
@@ -6048,6 +6118,7 @@ fn watch_sums(procs: &[ProcStat], name: &str) -> AppSums {
         out.net_bps += p.net_bps;
         out.net_rx_bps += p.net_rx_bps;
         out.net_tx_bps += p.net_tx_bps;
+        out.audio = out.audio.max(p.audio);
     }
     out
 }
