@@ -4,7 +4,7 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_LARGE_ICON, NIIF_USER,
-    NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -122,6 +122,19 @@ impl Tray {
                 set_tip(&mut nid, "Resource Monitor");
                 unsafe {
                     Shell_NotifyIconW(NIM_ADD, &mut nid);
+                    // Opt into version 3 behaviour. Without this the icon stays
+                    // at version 0, where the shell never sends the NIN_ balloon
+                    // messages — so `balloon_click` could not fire and clicking
+                    // a notification did nothing. The handler was wired at both
+                    // ends and dead in the middle.
+                    //
+                    // Version 3 and not 4 on purpose: version 4 repacks the
+                    // callback's wParam and lParam (coordinates in wParam, event
+                    // in the low word of lParam), and `WM_APP_TRAY` reads the
+                    // event straight out of lParam. Asking for 4 would silently
+                    // break every tray click to fix the balloon click.
+                    nid.Anonymous.uVersion = NOTIFYICON_VERSION;
+                    Shell_NotifyIconW(NIM_SETVERSION, &mut nid);
                     if !shared {
                         DestroyIcon(icon);
                     }
@@ -150,6 +163,19 @@ impl Tray {
                 set_tip(&mut nid, "Resource Monitor");
                 unsafe {
                     Shell_NotifyIconW(NIM_ADD, &mut nid);
+                    // Opt into version 3 behaviour. Without this the icon stays
+                    // at version 0, where the shell never sends the NIN_ balloon
+                    // messages — so `balloon_click` could not fire and clicking
+                    // a notification did nothing. The handler was wired at both
+                    // ends and dead in the middle.
+                    //
+                    // Version 3 and not 4 on purpose: version 4 repacks the
+                    // callback's wParam and lParam (coordinates in wParam, event
+                    // in the low word of lParam), and `WM_APP_TRAY` reads the
+                    // event straight out of lParam. Asking for 4 would silently
+                    // break every tray click to fix the balloon click.
+                    nid.Anonymous.uVersion = NOTIFYICON_VERSION;
+                    Shell_NotifyIconW(NIM_SETVERSION, &mut nid);
                     if !shared {
                         DestroyIcon(icon);
                     }

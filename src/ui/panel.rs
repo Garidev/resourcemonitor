@@ -339,8 +339,14 @@ pub struct Ui {
     layout_footer: usize,
     /// Visible metric-row count the current window height was computed for.
     layout_metrics: usize,
-    /// Where a click on the most recent desktop notification should land.
+    /// Where a click on the balloon currently on screen should land.
     balloon_target: Option<View>,
+    /// Notifications waiting to be shown. `Shell_NotifyIcon` gives an icon one
+    /// balloon at a time and raising a second replaces the first, so a batch
+    /// arriving together has to be paced or only the last of it is ever seen.
+    balloon_queue: std::collections::VecDeque<(String, String, bool)>,
+    /// Whether the pacing timer is running, so it is started once per burst.
+    balloon_timer: bool,
     edit: HWND,
     edit_val: HWND,
     edit_path: HWND,
@@ -675,6 +681,8 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         layout_footer: 0,
         layout_metrics: 0,
         balloon_target: None,
+        balloon_queue: std::collections::VecDeque::new(),
+        balloon_timer: false,
         edit,
         edit_val,
         edit_path,
@@ -778,19 +786,30 @@ impl Ui {
                 let pending: Vec<(String, String, bool)> =
                     std::mem::take(&mut *self.shared.notifications.lock().unwrap());
                 for (title, message, is_mcp) in pending {
-                    self.tray.balloon(&title, &message);
                     // Only MCP messages populate the Messages list and footer;
-                    // alert notifications just show as a desktop balloon.
+                    // alert notifications just show as a desktop balloon. The
+                    // list is filled straight away even though the balloons are
+                    // paced, so nothing is missing from it while a burst drains.
                     let from_mcp = is_mcp && self.cfg.mcp_enabled;
                     if from_mcp {
-                        self.mcp_messages.push_front((hhmm(), title, message));
+                        self.mcp_messages.push_front((hhmm(), title.clone(), message.clone()));
                         if self.mcp_messages.len() > 12 {
                             self.mcp_messages.pop_back();
                         }
                     }
-                    // Each balloon replaces the last, so only the final one in
-                    // a batch is still on screen to be clicked.
-                    self.balloon_target = if from_mcp { Some(View::McpMessages) } else { None };
+                    self.balloon_queue.push_back((title, message, from_mcp));
+                    // Drop from the front when the backlog is over the bound:
+                    // a stale alert is the least useful thing in the queue.
+                    while self.balloon_queue.len() > BALLOON_QUEUE_MAX {
+                        self.balloon_queue.pop_front();
+                    }
+                }
+                // Show one immediately and let the timer walk the remainder, so
+                // a single notification is still instant.
+                if !self.balloon_timer && !self.balloon_queue.is_empty() {
+                    self.balloon_timer = true;
+                    unsafe { SetTimer(hwnd, ID_BALLOON, BALLOON_MS, None) };
+                    self.next_balloon(hwnd);
                 }
                 if self.visible {
                     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
@@ -875,6 +894,10 @@ impl Ui {
                     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
                 }
                 None
+            }
+            WM_TIMER if wparam == ID_BALLOON => {
+                self.next_balloon(hwnd);
+                Some(0)
             }
             WM_TIMER if wparam == ID_FADE => {
                 let done = match &mut self.fade {
@@ -1758,6 +1781,20 @@ impl Ui {
                 self.draw_marker(dc, x, mid, self.s(MARKER_SM), u);
             }
         }
+    }
+
+    /// Show the next queued balloon, or stop the pacing timer once the queue
+    /// is empty. The click target is set from the balloon actually going on
+    /// screen rather than from whatever happened to be queued last, which is
+    /// what made clicking a notification open the wrong view.
+    fn next_balloon(&mut self, hwnd: HWND) {
+        let Some((title, message, from_mcp)) = self.balloon_queue.pop_front() else {
+            unsafe { KillTimer(hwnd, ID_BALLOON) };
+            self.balloon_timer = false;
+            return;
+        };
+        self.tray.balloon(&title, &message);
+        self.balloon_target = if from_mcp { Some(View::McpMessages) } else { None };
     }
 
     fn refresh_autostart(&mut self) {
@@ -5570,6 +5607,14 @@ const CHROME_GLYPH: i32 = 17;
 /// Timer id for the hover cross-fade, and its frame interval. 16 ms is one
 /// display frame at 60 Hz; 90 ms is six of them.
 const ID_FADE: usize = 1;
+const ID_BALLOON: usize = 2;
+/// Windows shows a tray balloon for around five seconds, so anything much
+/// shorter than this would replace a notification the user is still reading.
+const BALLOON_MS: u32 = 6000;
+/// A bound on the backlog. At six seconds each, an unbounded queue could
+/// spend minutes working through a burst, and by then the oldest entries are
+/// describing something that has long since stopped being true.
+const BALLOON_QUEUE_MAX: usize = 20;
 const FADE_MS: u32 = 16;
 const FADE_TOTAL_MS: f32 = 90.0;
 
