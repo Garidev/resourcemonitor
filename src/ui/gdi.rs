@@ -1144,6 +1144,9 @@ pub enum Units {
     Rate,
     /// A bare count, e.g. frames per second.
     Count,
+    /// Frames per second. Distinct from `Count` because the unit belongs on the
+    /// number: charts.md gives `144 fps` as the ceiling label, not `144`.
+    Fps,
 }
 
 impl Units {
@@ -1152,6 +1155,7 @@ impl Units {
             Units::Percent => format!("{:.0}%", v),
             Units::Rate => crate::util::format_rate(v.max(0.0) as u64),
             Units::Count => format!("{:.0}", v),
+            Units::Fps => format!("{:.0} fps", v),
         }
     }
 }
@@ -1416,30 +1420,46 @@ pub fn chart(
         }
     }
 
-    // Peak marker: the only direct label on the plot, and it works *because*
-    // it is the only one — so a mirrored chart, which always carries two, does
-    // not get it. Suppressed when the peak is the newest sample — the head dot
-    // already says that — or when the window is flat.
-    if size == ChartSize::Hero && !two_way && pts.len() > 2 {
-        let (mut pi, mut pv) = (0usize, f32::MIN);
-        for (i, v) in samples.iter().enumerate() {
-            if *v > pv {
-                (pi, pv) = (i, *v);
+    // Peak marker. A mirrored chart gets one per half: the peak is the whole
+    // reason to look at a disk or network graph, and with the halves on separate
+    // ceilings an unlabelled high point says nothing about how high it was.
+    // Suppressed when the peak is the newest sample — the head dot already says
+    // that — or when the window is flat.
+    if size == ChartSize::Hero {
+        let peak = |pts: &[(f32, f32)], samples: &[f32], below: bool| {
+            if pts.len() <= 2 {
+                return;
             }
-        }
-        let flat = samples.iter().cloned().fold(f32::MAX, f32::min) >= pv - 0.5;
-        if pi + 1 < pts.len() && !flat && pv > 0.0 {
+            let (mut pi, mut pv) = (0usize, f32::MIN);
+            for (i, v) in samples.iter().enumerate() {
+                if *v > pv {
+                    (pi, pv) = (i, *v);
+                }
+            }
+            let flat = samples.iter().cloned().fold(f32::MAX, f32::min) >= pv - 0.5;
+            if pi + 1 >= pts.len() || flat || pv <= 0.0 {
+                return;
+            }
             let (hx, hy) = (pts[pi].0.round() as i32, pts[pi].1.round() as i32);
             let tick = RECT { left: hx, top: hy - 3, right: hx + 1, bottom: hy + 4 };
             fill(dc, &tick, t().dim);
             if let Some(f) = font_micro {
                 let label = format!("peak {}", units.fmt(pv));
                 let w = text_width(dc, f, &label);
+                let (asc, desc, _) = text_metrics(dc, f);
                 // Whichever side has room; a label that runs off the plate is
                 // worse than one on the unexpected side.
                 let lx = if hx + 4 + w <= r.right { hx + 4 } else { hx - 4 - w };
-                text(dc, lx.max(r.left), hy - 14, f, t().dim, &label);
+                // The lower half's label hangs below its point, or the two halves
+                // would write over each other around the midline.
+                let ly = if below { hy + 5 } else { hy - (asc + desc) - 3 };
+                text(dc, lx.max(r.left), ly, f, t().dim, &label);
             }
+        };
+        peak(&pts, &samples, false);
+        if let Some(m) = &mirror {
+            let lo: Vec<f32> = m.ring.iter().collect();
+            peak(&lo_pts, &lo, true);
         }
     }
 

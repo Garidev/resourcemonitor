@@ -355,9 +355,6 @@ pub struct Ui {
     layout_footer: usize,
     /// Visible metric-row count the current window height was computed for.
     layout_metrics: usize,
-    /// The hero plot's rect from the last paint, so `on_snapshot` can tell
-    /// whether the cursor is inside it and hold the graph still if so.
-    hero_plot: RECT,
     /// Where a click on the balloon currently on screen should land.
     balloon_target: Option<View>,
     /// Notifications waiting to be shown. `Shell_NotifyIcon` gives an icon one
@@ -703,7 +700,6 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         layout_drives: 0,
         layout_footer: 0,
         layout_metrics: 0,
-        hero_plot: RECT { left: 0, top: 0, right: 0, bottom: 0 },
         balloon_target: None,
         balloon_queue: std::collections::VecDeque::new(),
         balloon_timer: false,
@@ -1116,19 +1112,15 @@ impl Ui {
         } else {
             0.0
         };
-        // While the graph is frozen the display rings do not advance, so a peak
-        // stays where it is instead of sliding out from under the cursor. Frozen
-        // means either the pause button is on or the pointer is over the plot.
+        // The pause button holds the display rings still; hovering does not.
+        // Freezing on hover was tried and removed: moving the pointer across a
+        // drill-down would stop the graph, which is a lot of surprise to pay for
+        // a peak the plot can simply label. The peak markers do that job instead.
         //
         // Only the rings stop. Alerts, the MCP server, the tray icons and the
-        // tooltip all read the snapshot directly, so nothing that matters is
-        // paused — this holds the picture, not the monitoring.
-        let over_plot = matches!(self.view, View::Drill(_) | View::FpsApps)
-            && self.hover_pos.is_some_and(|(x, y)| {
-                let p = self.hero_plot;
-                x >= p.left && x < p.right && y >= p.top && y < p.bottom
-            });
-        let frozen = self.paused || over_plot;
+        // tooltip all read the snapshot directly, so pausing holds the picture,
+        // not the monitoring.
+        let frozen = self.paused;
 
         // Only the display rings and their ceilings are inside this guard. The
         // tray icons, overlay, widget and relayout below it keep running, so a
@@ -3948,10 +3940,6 @@ impl Ui {
             let (ring, _, _, _) = self.hero_series(h);
             ring.iter().count()
         };
-        // Remembered for `on_snapshot`, which holds the rings still while the
-        // cursor is inside this rect so a peak stays put while it is being read.
-        self.hero_plot = plot;
-
         let (ring, accent, scale, kind) = self.hero_series(h);
         let cap = ring.capacity();
         // Only the rate scales consult a sticky ceiling; percent and FPS resolve
@@ -3995,6 +3983,7 @@ impl Ui {
         let primary_unit = match h {
             Hero::M(Metric::Disk) => Some("read"),
             Hero::M(Metric::Net) => Some("down"),
+            Hero::Fps => Some("fps"),
             _ => None,
         };
 
@@ -4022,7 +4011,11 @@ impl Ui {
         );
         let vs = match scale {
             Scale::Percent => format_pct(shown),
-            _ => format_rate(shown as u64),
+            // A frame rate is a bare number with `fps` hung off it as a unit,
+            // exactly as the metric row does it — not a rate in bytes, which is
+            // what the catch-all below was turning it into.
+            Scale::Fps => format!("{:.0}", shown),
+            Scale::Rate | Scale::Fixed(_) => format_rate(shown as u64),
         };
         let vy = plate.top + self.s(SP3) + (l_asc + l_desc) + self.s(SP1);
         gdi::text(dc, plate.left + self.s(SP4), vy, self.fonts.display, gdi::t().text, &vs);
@@ -5767,7 +5760,8 @@ fn chart_units(scale: Scale) -> gdi::Units {
     match scale {
         Scale::Percent => gdi::Units::Percent,
         Scale::Rate => gdi::Units::Rate,
-        Scale::Fps | Scale::Fixed(_) => gdi::Units::Count,
+        Scale::Fps => gdi::Units::Fps,
+        Scale::Fixed(_) => gdi::Units::Count,
     }
 }
 

@@ -202,8 +202,23 @@ panel has no room to label vertical rules, and unlabelled ones are decoration.
 left-hand tick column would cost 32 logical px of a 312 px plot for information
 that is redundant with a fixed 100 % ceiling and with the hover readout.
 
-**One peak marker per hero chart.** A 3 px tick in `dim` at the window maximum's
-`(x, y)`, with `micro dim` text `peak 82%` placed to whichever side has room.
+**One peak marker per series on a hero chart** — so one on a single-series plot
+and two on a mirrored one, one per half. A 3 px tick in `dim` at that series'
+maximum `(x, y)`, with `micro dim` text `peak 82%` placed to whichever side has
+room; the lower half's label hangs below its point so the two cannot write over
+each other around the midline.
+
+> **Revised after implementation.** This read "one peak marker per hero chart",
+> and the mirrored charts were built with no marker at all on the reasoning that a
+> plot already carrying two direction labels should not take a third. That was
+> backwards. The peak is the entire reason to look at a disk or network graph, and
+> with each half on its own ceiling an unlabelled high point says nothing about
+> how high it actually was. It also became the answer to a different problem:
+> freezing the graph on hover was tried so a peak could be read without sliding
+> away, and removed because stopping the graph whenever the pointer crosses it is
+> far too much surprise for the benefit. A labelled peak needs no interaction at
+> all.
+
 Suppressed when the peak is the newest sample (the head dot already says so) or
 when the window is flat (§6). This is the only direct label on the chart, and it
 works *because* it is the only one.
