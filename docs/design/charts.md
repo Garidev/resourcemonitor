@@ -278,8 +278,19 @@ charts.
 
 ### Network — download versus upload
 
-One quantity, two directions, so: **mirrored about the midline**, sharing one
-ceiling `nice(max(rx_max, tx_max))`.
+One quantity, two directions, so: **mirrored about the midline**, and **each
+half on its own sticky ceiling**.
+
+> **Revised after implementation.** This section originally specified one shared
+> ceiling, `nice(max(rx_max, tx_max))`, so that the two halves stayed comparable
+> by eye. Measured against real traffic that is the wrong trade: disk read runs
+> about seven times its write and download about twelve times its upload, and a
+> row chart gives each half fifteen pixels. The secondary drew one or two pixels
+> off the midline and was reported, correctly, as looking flat at zero. Each half
+> now scales to its own ceiling and **the hero plot labels both**, which puts the
+> asymmetry on the screen rather than hiding it inside a scale nobody can read.
+> Comparability was a real property and it has been given up deliberately; the
+> two ceiling labels are what replaces it.
 
 ```
         Down                                 12.4 MB/s
@@ -290,9 +301,18 @@ ceiling `nice(max(rx_max, tx_max))`.
         Up                                 0.9 MB/s
 ```
 
-- Down uses `net` at full strength; up uses `mix(net, dim, 0.45)` — a
-  desaturated sibling of the same hue, because direction is not identity. Both
-  clear 3:1 on every surface, since `dim` is itself 5.5:1.
+- Down uses `net` at full strength; up uses **its own hue**, `net_tx`
+  (blue-green), and disk write uses `disk_w` (gold).
+
+  > **Revised after implementation.** This originally read "up uses
+  > `mix(net, dim, 0.45)` — a desaturated sibling of the same hue, because
+  > direction is not identity". The reasoning still holds in the abstract and it
+  > lost to practice: a desaturated trace at a twelfth of the primary's height
+  > reads as a rendering artefact, not as a second series. Gold against cyan and
+  > blue-green against orange are complementary pairs, separable at a glance, and
+  > both sit in gaps the seven metric accents leave — so neither can be misread
+  > as another metric inside a row that already names its own. All four clear
+  > 4.5:1 on `card` in both themes.
 - Two permanent direct labels, `Down` and `Up`, in `micro mute` at the left of
   each half. **Never colour alone.**
 - Each half gets its own wash, gradient running away from the midline.
@@ -406,8 +426,12 @@ Translated from the `dataviz` method to this renderer:
   20 % → 6 % in light. Never a saturated block.
 - **Gridlines are one step off surface, hairline, solid.** Never dashed, never
   coloured.
-- **Direction is not identity**: down/up and read/write are two steps of one
-  hue plus permanent direct labels, not two hues.
+- **Direction gets its own hue, and keeps its label.** Down/up and read/write
+  are two hues — `net`/`net_tx` and `disk`/`disk_w` — *plus* the permanent direct
+  labels. The labels are not redundant: they are what stops the second hue being
+  read as a different metric, and they are what survives colourblindness. This
+  reverses the original rule, which asked for two steps of one hue; see §8 for
+  what real traffic did to it.
 - **Status never becomes a series colour.** `danger` on a chart means a
   threshold was crossed, nothing else. Reserved.
 - **A single series needs no legend** — the row's own label is the legend. Only

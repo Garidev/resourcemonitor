@@ -123,6 +123,8 @@ enum Action {
     /// in hit testing — which is what drives a repaint on mouse move — without
     /// doing anything when clicked.
     HoverCore,
+    /// Pin or unpin the sample under the cursor on the hero plot.
+    PinHero,
     OpenSettings,
     TogglePin,
     /// Dismiss the flyout (the × in the header strip).
@@ -297,9 +299,15 @@ pub struct Ui {
     /// 100 and FPS quantises off a 60 floor.
     ceil_disk: Ceiling,
     ceil_net: Ceiling,
+    /// The second direction gets its own ceiling. Shared, the smaller of the
+    /// two was drawing one or two pixels above the midline on a row chart.
+    ceil_disk_w: Ceiling,
+    ceil_net_tx: Ceiling,
     ceil_watch_ram: Ceiling,
     ceil_watch_disk: Ceiling,
     ceil_watch_net: Ceiling,
+    ceil_watch_disk_w: Ceiling,
+    ceil_watch_net_tx: Ceiling,
     hist_audio: Ring,
     hist_fps: Ring,
     view: View,
@@ -339,6 +347,14 @@ pub struct Ui {
     layout_footer: usize,
     /// Visible metric-row count the current window height was computed for.
     layout_metrics: usize,
+    /// A pinned sample on the hero plot, counted back from the newest so it
+    /// survives the window scrolling: 0 is the newest sample, 1 the one before
+    /// it. Stored this way because an absolute index would slide one sample to
+    /// the left on every tick and point at the wrong reading a second later.
+    pin_back: Option<usize>,
+    /// The hero plot's rect from the last paint, so a click can be turned back
+    /// into a sample index.
+    hero_plot: RECT,
     /// Where a click on the balloon currently on screen should land.
     balloon_target: Option<View>,
     /// Notifications waiting to be shown. `Shell_NotifyIcon` gives an icon one
@@ -660,9 +676,13 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         core_hist: Vec::new(),
         ceil_disk: Ceiling::default(),
         ceil_net: Ceiling::default(),
+        ceil_disk_w: Ceiling::default(),
+        ceil_net_tx: Ceiling::default(),
         ceil_watch_ram: Ceiling::default(),
         ceil_watch_disk: Ceiling::default(),
         ceil_watch_net: Ceiling::default(),
+        ceil_watch_disk_w: Ceiling::default(),
+        ceil_watch_net_tx: Ceiling::default(),
         hist_audio: Ring::new(60),
         hist_fps: Ring::new(60),
         view: View::Main,
@@ -680,6 +700,8 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         layout_drives: 0,
         layout_footer: 0,
         layout_metrics: 0,
+        pin_back: None,
+        hero_plot: RECT { left: 0, top: 0, right: 0, bottom: 0 },
         balloon_target: None,
         balloon_queue: std::collections::VecDeque::new(),
         balloon_timer: false,
@@ -1109,10 +1131,16 @@ impl Ui {
         for (r, pct) in self.core_hist.iter_mut().zip(s.core_pcts.iter()) {
             r.push(*pct);
         }
-        // One ceiling per chart, covering both halves, so a symmetric burst
-        // draws symmetrically and the two halves stay comparable by eye.
-        self.ceil_disk.update(self.hist_disk.max().max(self.hist_disk_w.max()));
-        self.ceil_net.update(self.hist_net.max().max(self.hist_net_tx.max()));
+        // One ceiling per direction. A shared one keeps the halves comparable,
+        // which reads well in a specification and badly on a real machine: disk
+        // read runs seven times its write and download twelve times its upload,
+        // so the shared scale left the secondary flat on the midline. Both
+        // ceilings are labelled on the hero plot, so the asymmetry is stated
+        // rather than hidden.
+        self.ceil_disk.update(self.hist_disk.max());
+        self.ceil_disk_w.update(self.hist_disk_w.max());
+        self.ceil_net.update(self.hist_net.max());
+        self.ceil_net_tx.update(self.hist_net_tx.max());
         // 0 when nothing is presenting, so the graph flatlines rather than
         // holding the last frame rate of an app that has since closed.
         self.hist_fps.push(s.fps.as_ref().map(|(_, _, f)| *f as f32).unwrap_or(0.0));
@@ -1131,7 +1159,9 @@ impl Ui {
                 self.watch_rings[7].push(a.net_tx_bps as f32);
                 self.watch_rings[5].push(watch_fps(&self.snap, &name) as f32);
                 self.ceil_watch_ram.update(self.watch_rings[1].max());
-                self.ceil_watch_disk.update(self.watch_rings[3].max().max(self.watch_rings[6].max()));
+                self.ceil_watch_disk.update(self.watch_rings[3].max());
+        self.ceil_watch_disk_w.update(self.watch_rings[6].max());
+        self.ceil_watch_net_tx.update(self.watch_rings[7].max());
                 self.ceil_watch_net.update(self.watch_rings[4].max());
             }
         }
@@ -2075,6 +2105,27 @@ impl Ui {
             Action::DraftCancel => self.navigate(hwnd, View::SettingsPage(SettingsPage::Alerts)),
             Action::PickApp => self.pick_app_menu(hwnd),
             Action::ShowFpsApps => self.navigate(hwnd, View::FpsApps),
+            Action::PinHero => {
+                // Turn the click's x back into a sample. Clicking the sample
+                // that is already pinned unpins it, so the same gesture undoes
+                // itself rather than needing somewhere else to click.
+                let View::Drill(m) = self.view else { return };
+                let (cap, held) = {
+                    let (ring, _, _, _) = self.hero_series(m);
+                    (ring.capacity(), ring.iter().count())
+                };
+                let plot = self.hero_plot;
+                let idx = self
+                    .hover_pos
+                    .and_then(|(hx, _)| gdi::chart_hit(&plot, cap, held, hx));
+                self.pin_back = match idx {
+                    Some(i) => {
+                        let back = held.saturating_sub(1).saturating_sub(i);
+                        if self.pin_back == Some(back) { None } else { Some(back) }
+                    }
+                    None => None,
+                };
+            }
             Action::TogglePause => {
                 self.paused = !self.paused;
                 self.frozen = if self.paused { Some(self.snap.clone()) } else { None };
@@ -3126,11 +3177,15 @@ impl Ui {
                     ring: &self.hist_disk_w,
                     label_hi: "Read",
                     label_lo: "Write",
+                    color: gdi::acc().disk_w,
+                    ceiling: self.ceil_disk_w.peek(),
                 }),
                 "net" => Some(gdi::Mirror {
                     ring: &self.hist_net_tx,
                     label_hi: "Down",
                     label_lo: "Up",
+                    color: gdi::acc().net_tx,
+                    ceiling: self.ceil_net_tx.peek(),
                 }),
                 _ => None,
             };
@@ -3858,20 +3913,22 @@ impl Ui {
         let (m_asc, m_desc, _) = gdi::text_metrics(dc, self.fonts.micro);
         let head_h = self.s(SP3) + (l_asc + l_desc) + self.s(SP1) + (d_asc + d_desc);
         let plot_h = self.s(HERO_PLOT_H);
-        let plate_h =
-            head_h + self.s(SP4) + plot_h + self.s(SP1) + (m_asc + m_desc) + self.s(SP3);
+        // Disk and Network carry a second figure under the first, so the plate
+        // is a line taller for them.
+        let two_way = matches!(m, Metric::Disk | Metric::Net);
+        let second_line = if two_way { self.s(SP1) + (m_asc + m_desc) } else { 0 };
+        let plate_h = head_h
+            + second_line
+            + self.s(SP4)
+            + plot_h
+            + self.s(SP1)
+            + (m_asc + m_desc)
+            + self.s(SP3);
         self.hero_h = plate_h + self.s(SP4);
         let plate = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + plate_h };
         gdi::card(dc, &plate, gdi::t().card, gdi::t().line, self.s(RADIUS));
 
-        let (ring, accent, scale, kind) = self.hero_series(m);
-        let held = ring.iter().count();
-        let cap = ring.capacity();
-        let sticky = if m == Metric::Disk { &self.ceil_disk } else { &self.ceil_net };
-        let ceiling = scale.ceiling(ring.max(), sticky);
-        let latest = ring.iter().last().unwrap_or(0.0);
-
-        let plot_top = plate.top + head_h + self.s(SP4);
+        let plot_top = plate.top + head_h + second_line + self.s(SP4);
         let plot = RECT {
             left: plate.left + self.s(SP4),
             top: plot_top,
@@ -3879,14 +3936,64 @@ impl Ui {
             bottom: plot_top + plot_h,
         };
 
-        // Which sample the cursor is over, if any. `hover_pos` is already
-        // tracked and already forces a repaint on change, so this costs nothing
-        // new to drive.
-        let hit = self
+        // Everything that mutates `self` happens before the ring is borrowed for
+        // drawing: `held` comes from a scoped borrow so the pin can be dropped
+        // and the hit registered without holding a reference across either.
+        let held = {
+            let (ring, _, _, _) = self.hero_series(m);
+            ring.iter().count()
+        };
+        // A pin that has scrolled off the left of the window is dropped, which
+        // is the one case where it should not survive a refresh.
+        if self.pin_back.is_some_and(|b| b + 1 > held) {
+            self.pin_back = None;
+        }
+        // The plot is clickable, so a peak can be pinned and read at leisure.
+        self.hero_plot = plot;
+        self.hits.push((plot, Action::PinHero));
+
+        let (ring, accent, scale, kind) = self.hero_series(m);
+        let cap = ring.capacity();
+        let sticky = if m == Metric::Disk { &self.ceil_disk } else { &self.ceil_net };
+        let ceiling = scale.ceiling(ring.max(), sticky);
+        let latest = ring.iter().last().unwrap_or(0.0);
+
+        // Hovering wins while the cursor is over the plot; otherwise a pinned
+        // sample holds, and only with neither does the readout follow the live
+        // value. `hover_pos` is already tracked and already forces a repaint on
+        // change, so this costs nothing new to drive.
+        let hovered = self
             .hover_pos
             .filter(|(_, hy)| *hy >= plot.top && *hy < plot.bottom)
             .and_then(|(hx, _)| gdi::chart_hit(&plot, cap, held, hx));
+        let pinned = self.pin_back.map(|b| held.saturating_sub(1).saturating_sub(b));
+        let hit = hovered.or(pinned);
         let shown = hit.and_then(|i| ring.iter().nth(i)).unwrap_or(latest);
+
+        // The second direction at the same sample, so a pinned peak reports both
+        // halves of the chart rather than only the half that happens to be on
+        // top. Read straight from the mirrored ring, so the two figures always
+        // describe the same instant.
+        let second: Option<(f32, &'static str, u32)> = match m {
+            Metric::Disk => Some((
+                hit.and_then(|i| self.hist_disk_w.iter().nth(i))
+                    .unwrap_or_else(|| self.hist_disk_w.iter().last().unwrap_or(0.0)),
+                "write",
+                gdi::acc().disk_w,
+            )),
+            Metric::Net => Some((
+                hit.and_then(|i| self.hist_net_tx.iter().nth(i))
+                    .unwrap_or_else(|| self.hist_net_tx.iter().last().unwrap_or(0.0)),
+                "up",
+                gdi::acc().net_tx,
+            )),
+            _ => None,
+        };
+        let primary_unit = match m {
+            Metric::Disk => Some("read"),
+            Metric::Net => Some("down"),
+            _ => None,
+        };
 
         let interval = self.cfg.interval_ms.max(1);
         let age = match hit {
@@ -3910,22 +4017,56 @@ impl Ui {
             Scale::Percent => format_pct(shown),
             _ => format_rate(shown as u64),
         };
-        gdi::text(
-            dc,
-            plate.left + self.s(SP4),
-            plate.top + self.s(SP3) + (l_asc + l_desc) + self.s(SP1),
-            self.fonts.display,
-            gdi::t().text,
-            &vs,
-        );
+        let vy = plate.top + self.s(SP3) + (l_asc + l_desc) + self.s(SP1);
+        gdi::text(dc, plate.left + self.s(SP4), vy, self.fonts.display, gdi::t().text, &vs);
+        // The word naming the primary direction sits on the big figure's
+        // baseline, the same way a metric row's unit does.
+        let mut after = plate.left + self.s(SP4) + gdi::text_width(dc, self.fonts.display, &vs);
+        if let Some(u) = primary_unit {
+            gdi::text_t(
+                dc,
+                after + self.s(SP2),
+                vy + d_asc - m_asc,
+                self.fonts.micro,
+                self.s(gdi::TRACK_MICRO),
+                gdi::t().mute,
+                u,
+            );
+            after += self.s(SP2) + gdi::text_width(dc, self.fonts.micro, u);
+        }
+        let _ = after;
+        // The second direction, under the first and in its own trace's colour,
+        // so the readout maps onto the chart without needing a legend.
+        if let Some((v2, u2, c2)) = second {
+            let s2 = format_rate(v2 as u64);
+            let y2 = vy + (d_asc + d_desc) + self.s(SP1);
+            gdi::text(dc, plate.left + self.s(SP4), y2, self.fonts.micro, c2, &s2);
+            gdi::text_t(
+                dc,
+                plate.left + self.s(SP4) + gdi::text_width(dc, self.fonts.micro, &s2) + self.s(SP2),
+                y2,
+                self.fonts.micro,
+                self.s(gdi::TRACK_MICRO),
+                gdi::t().mute,
+                u2,
+            );
+        }
+        // "pinned" replaces the age when a sample is held, because the age of a
+        // pinned sample keeps changing and the reading does not — saying "23s
+        // ago" next to a figure frozen at 14s ago would be a lie that grows.
+        let right_label = if hovered.is_none() && self.pin_back.is_some() {
+            format!("pinned · {}", age)
+        } else {
+            age.clone()
+        };
         gdi::text_right_t(
             dc,
             plate.right - self.s(SP4),
             plate.top + self.s(SP3),
             self.fonts.micro,
             self.s(gdi::TRACK_MICRO),
-            gdi::t().mute,
-            &age,
+            if hovered.is_none() && self.pin_back.is_some() { gdi::t().dim } else { gdi::t().mute },
+            &right_label,
         );
 
         gdi::chart(
@@ -3948,11 +4089,15 @@ impl Ui {
                     ring: &self.hist_disk_w,
                     label_hi: "Read",
                     label_lo: "Write",
+                    color: gdi::acc().disk_w,
+                    ceiling: self.ceil_disk_w.peek(),
                 }),
                 Metric::Net => Some(gdi::Mirror {
                     ring: &self.hist_net_tx,
                     label_hi: "Down",
                     label_lo: "Up",
+                    color: gdi::acc().net_tx,
+                    ceiling: self.ceil_net_tx.peek(),
                 }),
                 _ => None,
             },
@@ -4666,11 +4811,15 @@ impl Ui {
                         ring: &self.watch_rings[6],
                         label_hi: "Read",
                         label_lo: "Write",
+                        color: gdi::acc().disk_w,
+                        ceiling: self.ceil_watch_disk_w.peek(),
                     }),
                     4 => Some(gdi::Mirror {
                         ring: &self.watch_rings[7],
                         label_hi: "Down",
                         label_lo: "Up",
+                        color: gdi::acc().net_tx,
+                        ceiling: self.ceil_watch_net_tx.peek(),
                     }),
                     _ => None,
                 },

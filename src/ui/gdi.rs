@@ -22,6 +22,16 @@ pub struct Accents {
     pub net: u32,
     pub fps: u32,
     pub audio: u32,
+    /// The second direction of the two-way metrics: disk write and network
+    /// upload. Two steps of one hue was the original rule and it failed in
+    /// practice — real traffic is asymmetric enough that the weaker trace read
+    /// as a rendering artefact rather than as data — so each gets a hue of its
+    /// own, chosen from the gaps the seven metric accents leave. Gold and
+    /// blue-green are complementary to cyan and orange, so a pair is separable
+    /// at a glance, and neither is close enough to another accent to be misread
+    /// inside a row that already names its metric.
+    pub disk_w: u32,
+    pub net_tx: u32,
 }
 
 /// Surface palette; selectable at runtime from settings.
@@ -72,6 +82,8 @@ const ACC_DARK: Accents = Accents {
     net: rgb(241, 164, 39),
     fps: rgb(245, 116, 109),
     audio: rgb(235, 110, 201),
+    disk_w: rgb(232, 195, 58),
+    net_tx: rgb(63, 191, 160),
 };
 
 /// The same hue families pulled down for a white card: adjacent-pair ΔE 12.5,
@@ -84,6 +96,8 @@ const ACC_LIGHT: Accents = Accents {
     net: rgb(167, 102, 3),
     fps: rgb(211, 62, 71),
     audio: rgb(182, 57, 145),
+    disk_w: rgb(133, 100, 0),
+    net_tx: rgb(0, 122, 100),
 };
 
 pub const THEMES: [Theme; 3] = [
@@ -1173,6 +1187,16 @@ pub struct Mirror<'a> {
     pub ring: &'a Ring,
     pub label_hi: &'a str,
     pub label_lo: &'a str,
+    /// This half's own colour, not a shade of the primary's.
+    pub color: u32,
+    /// This half's own ceiling. Sharing the primary's keeps the two halves
+    /// comparable, which is what the specification asked for, but measured
+    /// against real traffic the secondary is routinely seven to twelve times
+    /// smaller — so on a 15 px half it drew one or two pixels above the midline
+    /// and read as flat. Each half now fills its own space and the hero plot
+    /// labels both ceilings, which puts the asymmetry on the screen instead of
+    /// hiding it in a scale nobody can see.
+    pub ceiling: f32,
 }
 
 pub fn chart(
@@ -1208,7 +1232,6 @@ pub fn chart(
     let anchor = if two_way { (r.top + r.bottom) / 2 } else { r.bottom - 1 };
     let span = if two_way { (h / 2 - 1).max(1) } else { (h - 2).max(1) };
     let py = |v: f32| anchor as f32 - span as f32 * (v / ceiling).clamp(0.0, 1.0);
-    let py_lo = |v: f32| anchor as f32 + span as f32 * (v / ceiling).clamp(0.0, 1.0);
 
     // 2. Un-sampled shading — the window visibly fills on first run instead of
     //    pretending the missing history was zero.
@@ -1323,12 +1346,16 @@ pub fn chart(
     // already means another metric — an orange disk-write trace reads as the
     // network — so the halves are told apart by the permanent labels below and
     // by strength, never by hue.
-    let color_lo = mix(color, t().dim, 0.45);
+    let color_lo = mirror.as_ref().map(|m| m.color).unwrap_or(color);
     let lo_pts: Vec<(f32, f32)> = match &mirror {
         Some(m) => {
+            let ceil_lo = m.ceiling.max(1.0);
+            let py_own = |v: f32| {
+                anchor as f32 + span as f32 * (v / ceil_lo).clamp(0.0, 1.0)
+            };
             let s2: Vec<f32> = m.ring.iter().collect();
             let start2 = cap.saturating_sub(s2.len());
-            s2.iter().enumerate().map(|(i, v)| (px(i, start2), py_lo(*v))).collect()
+            s2.iter().enumerate().map(|(i, v)| (px(i, start2), py_own(*v))).collect()
         }
         None => Vec::new(),
     };
@@ -1425,6 +1452,13 @@ pub fn chart(
     if size == ChartSize::Hero {
         if let Some(f) = font_micro {
             text_right(dc, r.right, r.top, f, t().dim, &units.fmt(ceiling));
+            // A mirrored plot has two scales, so it needs two labels. Without
+            // the second one the lower half would be an unlabelled axis and the
+            // halves would look comparable when they are not.
+            if let Some(m) = &mirror {
+                let (asc, desc, _) = text_metrics(dc, f);
+                text_right(dc, r.right, r.bottom - (asc + desc), f, t().dim, &units.fmt(m.ceiling));
+            }
         }
     }
 
