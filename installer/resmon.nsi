@@ -41,12 +41,26 @@ VIAddVersionKey "LegalCopyright" "${APP_PUBLISHER}"
 
 Section "${APP_NAME} (required)" SecMain
   SectionIn RO
-  ; Stop a running instance so the exe can be replaced.
+  ; Stop everything holding either binary open. The MCP shim matters as much as
+  ; the app: it is spawned by whichever AI client connects, it stays alive for
+  ; that client's whole session, and Windows locks a running exe against being
+  ; overwritten. Killing only resmon.exe is why an install could leave the app
+  ; updated and the shim months old, with nothing on screen to say so — the two
+  ; then speak different versions of the pipe protocol at each other.
   nsExec::Exec 'taskkill /F /IM ${APP_EXE}'
-  Sleep 400
+  nsExec::Exec 'taskkill /F /IM resmon-mcp.exe'
+  Sleep 600
   SetOutPath "$INSTDIR"
+  ; Refuse the install rather than half-finish it. A mismatched pair is worse
+  ; than no install, because a stale shim fails quietly and at a distance.
+  SetOverwrite on
+  ClearErrors
   File "..\target\x86_64-pc-windows-gnu\release\${APP_EXE}"
   File "..\target\x86_64-pc-windows-gnu\release\resmon-mcp.exe"
+  IfErrors 0 filesWritten
+    MessageBox MB_ICONSTOP "Could not replace the program files.$\r$\n$\r$\nSomething still has them open. Close Resource Monitor and any AI tool connected to it, then run this installer again."
+    Abort
+  filesWritten:
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
@@ -73,8 +87,10 @@ Section "Start with Windows (elevated, no UAC prompts)" SecAutostart
 SectionEnd
 
 Section "Uninstall"
+  ; Same pair as the install: the shim holds its own file open.
   nsExec::Exec 'taskkill /F /IM ${APP_EXE}'
-  Sleep 400
+  nsExec::Exec 'taskkill /F /IM resmon-mcp.exe'
+  Sleep 600
   nsExec::Exec 'schtasks /Delete /F /TN ResourceMonitor'
   nsExec::Exec 'schtasks /Delete /F /TN ResMon'
   Delete "$INSTDIR\${APP_EXE}"

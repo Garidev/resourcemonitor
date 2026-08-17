@@ -51,15 +51,20 @@ pub struct Theme {
     pub input_bg: u32,
     pub input_border: u32,
     pub text: u32,
-    pub dim: u32,
-    /// Third ink step, below `dim`: units, ticks, times, secondary figures.
+    /// The only ink below `text`. Units, ticks, times, prose, secondary figures,
+    /// hints, status lines and the direction markers all take it, at 7.0:1 on
+    /// `card`.
     ///
-    /// This is the smallest text in the product at the 10 px micro step, so it
-    /// is held to the same 4.5:1 floor as body text against **both** `card` and
-    /// `bg` — not the 3:1 a large-text exemption would allow. The first cut of
-    /// this palette sat at 3.47:1 on the dark card and was reported as hard to
-    /// read, which it was.
-    pub mute: u32,
+    /// There used to be a third step, `mute`, and it was reported as hard to read
+    /// three separate times. The first cut of it measured 3.47:1 on the dark card
+    /// and was raised to 4.72:1, which clears the 4.5:1 floor — and it was
+    /// reported again anyway, as giving a headache in both themes. The floor was
+    /// never the binding constraint at this size: 4.5:1 assumes 12–14 px at
+    /// normal weight, and this was 11 px at 500 with a pixel of tracking, some of
+    /// it drawn as hairline strokes with no mass at all. Rather than keep a
+    /// palette entry whose every use had to be argued about, the step is gone and
+    /// there are two text inks. See §2 rule 3 of ui-foundation.md.
+    pub dim: u32,
     pub danger: u32,
     pub warn: u32,
     /// The healthy end of the severity ramp. No caller yet — nothing in the
@@ -114,7 +119,6 @@ pub const THEMES: [Theme; 3] = [
         input_border: rgb(62, 67, 76),
         text: rgb(232, 234, 237),
         dim: rgb(166, 170, 180),
-        mute: rgb(134, 138, 148),
         danger: rgb(242, 85, 90),
         warn: rgb(232, 163, 58),
         good: rgb(70, 190, 113),
@@ -133,7 +137,6 @@ pub const THEMES: [Theme; 3] = [
         input_border: rgb(52, 57, 65),
         text: rgb(237, 239, 242),
         dim: rgb(151, 155, 165),
-        mute: rgb(120, 124, 134),
         danger: rgb(242, 85, 90),
         warn: rgb(232, 163, 58),
         good: rgb(70, 190, 113),
@@ -152,7 +155,6 @@ pub const THEMES: [Theme; 3] = [
         input_border: rgb(195, 201, 210),
         text: rgb(20, 23, 28),
         dim: rgb(78, 82, 92),
-        mute: rgb(104, 108, 118),
         danger: rgb(194, 38, 46),
         warn: rgb(154, 95, 0),
         good: rgb(26, 135, 49),
@@ -256,7 +258,14 @@ fn round_pen(width: i32, color: u32) -> HPEN {
 /// `SetTextCharacterExtra` is the only tracking GDI offers and it is integral,
 /// so these are already rounded to what the call can express.
 pub const TRACK_LABEL: i32 = 1;
-pub const TRACK_MICRO: i32 = 1;
+/// Tracking for the `micro` step: none. It was 1 px, on the reasoning that the
+/// smallest type needs air between its letters. That holds for the ALL-CAPS
+/// labels the step also draws, and is wrong for the lowercase words it mostly
+/// draws — "used", "read", "write", "312 GB free of 1.0 TB" — where spacing the
+/// letters stops the word reading as a single shape. Kept as a named constant so
+/// the call sites do not have to change, and so this reasoning has somewhere to
+/// live.
+pub const TRACK_MICRO: i32 = 0;
 
 /// Six type steps, plus two narrower cuts of the value step used only when a
 /// value will not otherwise clear its metric name. Weight 600 is what does most
@@ -296,7 +305,7 @@ impl Fonts {
             value: make_font(s(15.0), 600),
             body: make_font(s(14.0), 400),
             label: make_font(s(12.0), 600),
-            micro: make_font(s(11.0), 500),
+            micro: make_font(s(11.0), 600),
             value_sm: make_font(s(14.0), 600),
             value_xs: make_font(s(13.0), 600),
         }
@@ -1402,8 +1411,8 @@ pub fn chart(
     if let (Some(m), Some(f)) = (&mirror, font_micro) {
         let (asc, desc, _) = text_metrics(dc, f);
         if span >= asc + desc + 2 {
-            text(dc, r.left + 2, r.top + 1, f, t().mute, m.label_hi);
-            text(dc, r.left + 2, r.bottom - (asc + desc) - 1, f, t().mute, m.label_lo);
+            text(dc, r.left + 2, r.top + 1, f, t().dim, m.label_hi);
+            text(dc, r.left + 2, r.bottom - (asc + desc) - 1, f, t().dim, m.label_lo);
         }
     }
 

@@ -263,12 +263,25 @@ unit, and sometimes a secondary figure. Three rules:
    or not that row has a secondary figure.
 2. **The secondary figure is bottom-anchored**, drawn as its own `text_right`
    rather than concatenated into the value string.
-3. **Figures take `text`; the words and markers naming them take `mute`.** Size
+3. **Figures take `text`; the words and markers naming them take `dim`.** Size
    is what separates a secondary figure from a primary one — never ink. So
-   `12 MB/s` reads in `text` at the `micro` step while `write` beside it stays
-   `mute`, and the network row's `↑` marker stays `mute` for the same reason.
-   Prose is not a figure: `in Cyberpunk2077.exe` and `run as administrator to
-   see` stay `mute` whole.
+   `12 MB/s` reads in `text` at the `micro` step while `write` beside it is `dim`,
+   and the network row's `↑` marker is `dim` for the same reason. Prose is not a
+   figure: `in Cyberpunk2077.exe` and `run as administrator to see` are `dim`
+   whole.
+
+   **`mute` is no longer a text ink anywhere in the panel.** It measured 4.72:1
+   on the dark card, which clears the 4.5:1 floor, and was still reported as
+   giving a headache to read in both themes. The ratio was not the thing that was
+   wrong. Three things it does not capture were: the `micro` step was 500 weight
+   at 11 px, which is thin enough that contrast stops predicting legibility; it
+   carried 1 px of tracking, a device for ALL-CAPS labels that pulls a lowercase
+   word like `used` apart until it is four letters instead of one shape; and the
+   direction markers were a 1 px hairline, which has no mass to carry a ratio at
+   all. `micro` is now 600, its tracking is 0, the markers are `size/6` thick
+   with a floor of 2, and every one of these takes `dim` at 7.0:1. WCAG's floor
+   assumes 12–14 px at normal weight; below that it is a necessary condition and
+   not a sufficient one.
 
    Rule 3 was learned twice. The secondary figures were first drawn in `mute`
    and reported as unreadable, which moved them to `dim`; `dim` was reported as
@@ -389,7 +402,7 @@ The metric row (`panel.rs:2453-2465`) as it stands and as proposed:
 | label x | `row.left + s(10)` | `row.left + s(SP4)` = 12 |
 | label y | `y + s(6)` | `y + s(SP3)` = 8 |
 | value y | `y + s(21)` | baseline-centred on the card midline, in **every** row (see §2) |
-| unit label | part of the value string | `micro`/`mute`, `SP2` to the right of the value, sharing its baseline |
+| unit label | part of the value string | `micro`/`dim`, `SP2` to the right of the value, sharing its baseline |
 | secondary y | part of the value string | separate `text_right`, bottom-anchored at `y + s(CARD_METRIC) - s(SP2)` |
 | chart box | `right - s(118) … right - s(8)`, `y+s(7) … y+s(39)` | `right - s(120) … right - s(SP4)`, `y + s(SP3) … y + s(40)` |
 | stride | `y += s(52)` | `y += s(ROW_METRIC=56)` |
@@ -494,7 +507,10 @@ what makes a wash sit *on* the card rather than fade toward black.
 
 `card` on `bg` goes from **1.20:1 to 1.35:1** — enough for the card to read as
 a raised plane without turning the panel into a set of grey boxes. `text` on
-`card` 13.5:1; `dim` 5.5:1; `mute` 3.5:1 (labels only, never prose).
+`card` 13.5:1; `dim` 7.0:1; `mute` 4.7:1. **`mute` is retained in the theme and
+used for nothing textual** — see §2 rule 3. The note that once read "labels only,
+never prose" was already being contradicted by the code on units, prose, hints
+and status lines, and raising all of them to `dim` was the fix.
 
 **Black** (OLED)
 
@@ -746,7 +762,7 @@ rate rather than as an icon in their own right (see §2):
 | **`down`** | stem `(0,-6.6)→(0,4.4)`, head `(-3.8,0.9)→(0,5.8)→(3.8,0.9)` |
 | **`up`** | the same, mirrored in y |
 
-Two `Polyline`s each, on the pen §5 already establishes. They take `mute`, never
+Two `Polyline`s each, on the pen §5 already establishes. They take `dim`, never
 an accent — the accent is spent on the metric name, and a marker that competed
 with it would read as a third identity channel that means nothing.
 

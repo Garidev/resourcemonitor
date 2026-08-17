@@ -133,8 +133,6 @@ enum Action {
     /// in hit testing — which is what drives a repaint on mouse move — without
     /// doing anything when clicked.
     HoverCore,
-    /// Pin or unpin the sample under the cursor on the hero plot.
-    PinHero,
     OpenSettings,
     TogglePin,
     /// Dismiss the flyout (the × in the header strip).
@@ -357,13 +355,8 @@ pub struct Ui {
     layout_footer: usize,
     /// Visible metric-row count the current window height was computed for.
     layout_metrics: usize,
-    /// A pinned sample on the hero plot, counted back from the newest so it
-    /// survives the window scrolling: 0 is the newest sample, 1 the one before
-    /// it. Stored this way because an absolute index would slide one sample to
-    /// the left on every tick and point at the wrong reading a second later.
-    pin_back: Option<usize>,
-    /// The hero plot's rect from the last paint, so a click can be turned back
-    /// into a sample index.
+    /// The hero plot's rect from the last paint, so `on_snapshot` can tell
+    /// whether the cursor is inside it and hold the graph still if so.
     hero_plot: RECT,
     /// Where a click on the balloon currently on screen should land.
     balloon_target: Option<View>,
@@ -574,7 +567,7 @@ unsafe extern "system" fn edit_hint_proc(
         if !font.is_null() {
             let (asc, desc, _) = gdi::text_metrics(dc, font);
             let y = ((r.bottom - r.top) - (asc + desc)) / 2;
-            gdi::text(dc, 1, y.max(0), font, gdi::t().mute, &hint);
+            gdi::text(dc, 1, y.max(0), font, gdi::t().dim, &hint);
         }
         windows_sys::Win32::Graphics::Gdi::ReleaseDC(hwnd, dc);
     }
@@ -710,7 +703,6 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         layout_drives: 0,
         layout_footer: 0,
         layout_metrics: 0,
-        pin_back: None,
         hero_plot: RECT { left: 0, top: 0, right: 0, bottom: 0 },
         balloon_target: None,
         balloon_queue: std::collections::VecDeque::new(),
@@ -1706,8 +1698,11 @@ impl Ui {
         if u != Unit::Down && u != Unit::Up {
             return;
         }
-        let th = (size / 8).max(1);
-        gdi::arrow(dc, x + size / 2, mid, size, th, gdi::t().mute, u == Unit::Down);
+        // A 1 px stroke in the faintest ink is the least legible thing the panel
+        // drew: a hairline has no mass to carry a contrast ratio, so it measured
+        // as passing and read as absent. Thicker, and a step brighter.
+        let th = (size / 6).max(2);
+        gdi::arrow(dc, x + size / 2, mid, size, th, gdi::t().dim, u == Unit::Down);
     }
 
     /// A metric row's right-hand figures, per §2 of the UI foundation.
@@ -1755,7 +1750,7 @@ impl Ui {
                     vy + vasc - masc,
                     self.fonts.micro,
                     self.s(gdi::TRACK_MICRO),
-                    gdi::t().mute,
+                    gdi::t().dim,
                     w,
                 );
             }
@@ -1770,7 +1765,7 @@ impl Ui {
         // was the first attempt at this and was still reported as too faint —
         // which it was, because the row's own value sits beside it in `text` and
         // gives the eye an immediate comparison.
-        let sub_ink = if f.sub_is_figure { gdi::t().text } else { gdi::t().mute };
+        let sub_ink = if f.sub_is_figure { gdi::t().text } else { gdi::t().dim };
         gdi::text_right_t(
             dc,
             right - suw,
@@ -1794,7 +1789,7 @@ impl Ui {
                     sy,
                     self.fonts.micro,
                     self.s(gdi::TRACK_MICRO),
-                    gdi::t().mute,
+                    gdi::t().dim,
                     w,
                 );
             }
@@ -1830,7 +1825,7 @@ impl Ui {
                     y + vasc - masc,
                     self.fonts.micro,
                     self.s(gdi::TRACK_MICRO),
-                    gdi::t().mute,
+                    gdi::t().dim,
                     w,
                 );
             }
@@ -2135,31 +2130,6 @@ impl Ui {
             Action::DraftCancel => self.navigate(hwnd, View::SettingsPage(SettingsPage::Alerts)),
             Action::PickApp => self.pick_app_menu(hwnd),
             Action::ShowFpsApps => self.navigate(hwnd, View::FpsApps),
-            Action::PinHero => {
-                // Turn the click's x back into a sample. Clicking the sample
-                // that is already pinned unpins it, so the same gesture undoes
-                // itself rather than needing somewhere else to click.
-                let hero = match self.view {
-                    View::Drill(m) => Hero::M(m),
-                    View::FpsApps => Hero::Fps,
-                    _ => return,
-                };
-                let (cap, held) = {
-                    let (ring, _, _, _) = self.hero_series(hero);
-                    (ring.capacity(), ring.iter().count())
-                };
-                let plot = self.hero_plot;
-                let idx = self
-                    .hover_pos
-                    .and_then(|(hx, _)| gdi::chart_hit(&plot, cap, held, hx));
-                self.pin_back = match idx {
-                    Some(i) => {
-                        let back = held.saturating_sub(1).saturating_sub(i);
-                        if self.pin_back == Some(back) { None } else { Some(back) }
-                    }
-                    None => None,
-                };
-            }
             Action::TogglePause => {
                 self.paused = !self.paused;
                 self.frozen = if self.paused { Some(self.snap.clone()) } else { None };
@@ -2882,7 +2852,7 @@ impl Ui {
             (frame.top + frame.bottom) / 2,
             self.s(GLYPH),
             self.s(1).max(1),
-            gdi::t().mute,
+            gdi::t().dim,
             gdi::t().input_bg,
             gdi::Icon::Search,
         );
@@ -3978,14 +3948,9 @@ impl Ui {
             let (ring, _, _, _) = self.hero_series(h);
             ring.iter().count()
         };
-        // A pin that has scrolled off the left of the window is dropped, which
-        // is the one case where it should not survive a refresh.
-        if self.pin_back.is_some_and(|b| b + 1 > held) {
-            self.pin_back = None;
-        }
-        // The plot is clickable, so a peak can be pinned and read at leisure.
+        // Remembered for `on_snapshot`, which holds the rings still while the
+        // cursor is inside this rect so a peak stays put while it is being read.
         self.hero_plot = plot;
-        self.hits.push((plot, Action::PinHero));
 
         let (ring, accent, scale, kind) = self.hero_series(h);
         let cap = ring.capacity();
@@ -3995,16 +3960,17 @@ impl Ui {
         let ceiling = scale.ceiling(ring.max(), sticky);
         let latest = ring.iter().last().unwrap_or(0.0);
 
-        // Hovering wins while the cursor is over the plot; otherwise a pinned
-        // sample holds, and only with neither does the readout follow the live
-        // value. `hover_pos` is already tracked and already forces a repaint on
-        // change, so this costs nothing new to drive.
-        let hovered = self
+        // The readout follows the cursor while it is over the plot, and returns
+        // to the live value the moment it leaves. There is deliberately no way to
+        // pin a sample: pinning meant the headline number stopped being the
+        // current one, and the current one is what the panel is for. Freezing the
+        // graph on hover already covers reading a peak without it sliding away,
+        // which was pinning's only real job. `hover_pos` is already tracked and
+        // already forces a repaint on change, so this costs nothing to drive.
+        let hit = self
             .hover_pos
             .filter(|(_, hy)| *hy >= plot.top && *hy < plot.bottom)
             .and_then(|(hx, _)| gdi::chart_hit(&plot, cap, held, hx));
-        let pinned = self.pin_back.map(|b| held.saturating_sub(1).saturating_sub(b));
-        let hit = hovered.or(pinned);
         let shown = hit.and_then(|i| ring.iter().nth(i)).unwrap_or(latest);
 
         // The second direction at the same sample, so a pinned peak reports both
@@ -4039,7 +4005,7 @@ impl Ui {
                 if back == 0 {
                     "now".to_string()
                 } else {
-                    format!("\u{2212}{}s", back * interval / 1000)
+                    format!("{}s ago", back * interval / 1000)
                 }
             }
             None => "now".to_string(),
@@ -4070,7 +4036,7 @@ impl Ui {
                 vy + d_asc - m_asc,
                 self.fonts.micro,
                 self.s(gdi::TRACK_MICRO),
-                gdi::t().mute,
+                gdi::t().dim,
                 u,
             );
             after += self.s(SP2) + gdi::text_width(dc, self.fonts.micro, u);
@@ -4088,26 +4054,22 @@ impl Ui {
                 y2,
                 self.fonts.micro,
                 self.s(gdi::TRACK_MICRO),
-                gdi::t().mute,
+                gdi::t().dim,
                 u2,
             );
         }
-        // "pinned" replaces the age when a sample is held, because the age of a
-        // pinned sample keeps changing and the reading does not — saying "23s
-        // ago" next to a figure frozen at 14s ago would be a lie that grows.
-        let right_label = if hovered.is_none() && self.pin_back.is_some() {
-            format!("{} · pinned", age)
-        } else {
-            age.clone()
-        };
+        // Just how far back the reading is: "now" when it is live, "43s ago"
+        // while the cursor sits on an older sample. No "pinned" marker — there is
+        // nothing to mark now that samples cannot be held, and the word read as
+        // "pinned 43 seconds ago", which is not what it meant.
         gdi::text_right_t(
             dc,
             plate.right - self.s(SP4),
             plate.top + self.s(SP3),
             self.fonts.micro,
             self.s(gdi::TRACK_MICRO),
-            if hovered.is_none() && self.pin_back.is_some() { gdi::t().dim } else { gdi::t().mute },
-            &right_label,
+            gdi::t().dim,
+            &age,
         );
 
         gdi::chart(
@@ -4153,7 +4115,7 @@ impl Ui {
             plot.bottom + self.s(SP1),
             self.fonts.micro,
             self.s(gdi::TRACK_MICRO),
-            gdi::t().mute,
+            gdi::t().dim,
             &format!("{}s", secs),
         );
         y + self.hero_h()
@@ -4347,7 +4309,7 @@ impl Ui {
                 y,
                 self.fonts.micro,
                 self.s(gdi::TRACK_MICRO),
-                gdi::t().mute,
+                gdi::t().dim,
                 readout.as_deref().unwrap_or("hover a core for its number and peak"),
             );
             y += self.s(SP5);
@@ -4742,7 +4704,7 @@ impl Ui {
             y,
             self.fonts.micro,
             self.s(gdi::TRACK_MICRO),
-            gdi::t().mute,
+            gdi::t().dim,
             &status,
         );
         y += self.s(SP6);
