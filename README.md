@@ -26,7 +26,9 @@ reads a handful of system counters at the chosen interval.
   with a filter box, mouse-wheel scrolling, a pause toggle that freezes the
   list so fast-moving rows can be clicked, and an × per row to end every
   process with that name (with a confirmation dialog). The CPU drill-down adds
-  a per-core bar grid.
+  a per-core bar grid, behind a `CPU cores (n)` disclosure that is closed by
+  default; hovering a bar names the core and its percentage on the disclosure
+  row.
 - **FPS counter**: PresentMon-style ETW tracing of DXGI Present events shows
   the frame rate of whatever game/3D app is currently presenting. Clicking the
   FPS row lists every presenting app and its frame rate.
@@ -73,6 +75,14 @@ reads a handful of system counters at the chosen interval.
   box and metric chips: pick cpu / ram / gpu / disk / net / sound and the list
   re-sorts and shows that column, so "which one is making that noise" is one
   click.
+- **Go to a window**: double-click a process row (or the "3 running" line
+  under the app's name) to bring that program's window to the front. Most
+  listed processes own no window at all — service hosts, browser renderers, a
+  browser's audio service — so it falls back to a sibling process of the same
+  program that does. Note the limit this implies: it can put you in Chrome,
+  but not on the *tab* playing sound; a tab is a sandboxed process with no
+  window of its own. Chrome's own tab search (Ctrl+Shift+A) lists audible tabs
+  at the top.
 - **Alerts** — user-defined rules managed entirely in the settings GUI:
   per-rule enable/disable and delete, and a "+ new alert" builder (metric,
   above/below, threshold, delivery, include-top-apps, cooldown). Each alert

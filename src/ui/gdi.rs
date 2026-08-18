@@ -1135,8 +1135,8 @@ pub fn aa_disc(surf: &Surface, clip: &RECT, cx: f32, cy: f32, r: f32, color: u32
     }
 }
 
-/// How a chart's own labels — peak, ceiling — should format a value. Without
-/// this a rate's peak label printed the raw byte count.
+/// How a chart's own labels — the ceiling — should format a value. Without
+/// this a rate's ceiling label printed the raw byte count.
 #[derive(Copy, Clone, PartialEq)]
 pub enum Units {
     Percent,
@@ -1165,7 +1165,7 @@ impl Units {
 pub enum ChartSize {
     /// The 120×32 sparkline in a metric row: trace, wash and baseline only.
     Row,
-    /// The full-width plot in a drill-down: gridlines and a peak marker too.
+    /// The full-width plot in a drill-down: gridlines and a ceiling label too.
     Hero,
 }
 
@@ -1191,24 +1191,29 @@ pub fn chart_hit(r: &RECT, cap: usize, held: usize, hx: i32) -> Option<usize> {
 }
 
 /// The second half of a two-way metric: download against upload, read against
-/// write. Drawn below the midline, sharing the primary's ceiling.
+/// write. Drawn below the midline, on its own ceiling.
 ///
-/// `label_hi` and `label_lo` are permanent direct labels — never colour alone.
-/// They name the halves so the pair does not depend on a reader noticing that
-/// one trace is a shade weaker than the other.
+/// The halves carry no labels of their own. `Read`/`Write` and `Down`/`Up` used
+/// to be drawn inside the plot's top-left and bottom-left corners — permanent
+/// direct labels, so the pair never depended on colour alone. The corners are
+/// where the traces are, though, and on a busy window the trace ran straight
+/// through the word. The hero plate above the plot already prints both figures,
+/// each with its direction spelled out and set in that half's own colour, one
+/// above the other in the order the halves appear: that is the direct label,
+/// and it sits where there is room for it. A `Row`-size chart never had these
+/// (it passes no font) and its value text names both directions.
 pub struct Mirror<'a> {
     pub ring: &'a Ring,
-    pub label_hi: &'a str,
-    pub label_lo: &'a str,
     /// This half's own colour, not a shade of the primary's.
     pub color: u32,
     /// This half's own ceiling. Sharing the primary's keeps the two halves
     /// comparable, which is what the specification asked for, but measured
     /// against real traffic the secondary is routinely seven to twelve times
     /// smaller — so on a 15 px half it drew one or two pixels above the midline
-    /// and read as flat. Each half now fills its own space and the hero plot
-    /// labels both ceilings, which puts the asymmetry on the screen instead of
-    /// hiding it in a scale nobody can see.
+    /// and read as flat. Each half now fills its own space. The two ceilings
+    /// went unlabelled with every other rate ceiling, so the asymmetry is no
+    /// longer stated in text — but an upload that fills its half is visible,
+    /// which a one-pixel upload against the download's scale was not.
     pub ceiling: f32,
 }
 
@@ -1225,11 +1230,6 @@ pub fn chart(
     font_micro: Option<HFONT>,
     units: Units,
     mirror: Option<Mirror>,
-    // `peak_marker`: whether a peak is a meaningful thing to name on this
-    // series. False for sound, where the row is a *level* and "peak 62%" beside
-    // a volume reads as a peak meter — a different measurement the app does not
-    // take. Also false for every Row-size chart, which draws no peak anyway.
-    peak_marker: bool,
 ) {
     let cap = ring.capacity();
     let (w, h) = (r.right - r.left, r.bottom - r.top);
@@ -1414,83 +1414,6 @@ pub fn chart(
         trace(&lo_pts, color_lo);
     }
 
-    // Permanent direct labels for the two halves — never colour alone. Gated on
-    // there being a half tall enough to hold text: at row height the label would
-    // sit on the trace, and the row's own value already names both directions.
-    if let (Some(m), Some(f)) = (&mirror, font_micro) {
-        let (asc, desc, _) = text_metrics(dc, f);
-        if span >= asc + desc + 2 {
-            text(dc, r.left + 2, r.top + 1, f, t().dim, m.label_hi);
-            text(dc, r.left + 2, r.bottom - (asc + desc) - 1, f, t().dim, m.label_lo);
-        }
-    }
-
-    // Peak marker. A mirrored chart gets one per half: the peak is the whole
-    // reason to look at a disk or network graph, and with the halves on separate
-    // ceilings an unlabelled high point says nothing about how high it was.
-    // Suppressed when the peak is the newest sample — the head dot already says
-    // that — or when the window is flat.
-    if size == ChartSize::Hero && peak_marker {
-        // The tick marks *where* the peak was; a label in a fixed slot says how
-        // big it was. Placing the label beside its tick meant it moved with the
-        // data, so near an edge it landed on whatever the corner already held —
-        // the direction labels at the left, the ceilings at the right, and at the
-        // very start of the window all of it at once. A slot cannot collide, and
-        // nothing is lost: the tick is what carries the position.
-        //
-        // Upper series takes the top row, lower series the bottom, each starting
-        // after that half's direction label so the two read as one line:
-        // "Read   peak 19.1 MB/s".
-        let peak = |pts: &[(f32, f32)], samples: &[f32], below: bool| {
-            if pts.len() <= 2 {
-                return;
-            }
-            let (mut pi, mut pv) = (0usize, f32::MIN);
-            for (i, v) in samples.iter().enumerate() {
-                if *v > pv {
-                    (pi, pv) = (i, *v);
-                }
-            }
-            // Suppressed when the peak is the newest sample — the head dot
-            // already says so — or when the window is flat.
-            let flat = samples.iter().cloned().fold(f32::MAX, f32::min) >= pv - 0.5;
-            if pi + 1 >= pts.len() || flat || pv <= 0.0 {
-                return;
-            }
-            let (hx, hy) = (pts[pi].0.round() as i32, pts[pi].1.round() as i32);
-            let tick = RECT { left: hx, top: hy - 3, right: hx + 1, bottom: hy + 4 };
-            fill(dc, &tick, t().dim);
-
-            let Some(f) = font_micro else { return };
-            let label = format!("peak {}", units.fmt(pv));
-            let (asc, desc, _) = text_metrics(dc, f);
-            let lh = asc + desc;
-            let dir = match &mirror {
-                Some(m) => text_width(dc, f, if below { m.label_lo } else { m.label_hi }) + 10,
-                None => 0,
-            };
-            let lx = r.left + 2 + dir;
-            let ly = if below { r.bottom - lh - 1 } else { r.top + 1 };
-            // The ceiling labels are right-aligned on these same two rows, so on
-            // a narrow plot the two can still meet. Then the label goes, not the
-            // ceiling: a scale you cannot read makes the whole plot unreadable,
-            // and the tick still shows where the peak was.
-            let ceil_w = if below {
-                mirror.as_ref().map_or(0, |m| text_width(dc, f, &units.fmt(m.ceiling)) + 10)
-            } else {
-                text_width(dc, f, &units.fmt(ceiling)) + 10
-            };
-            if lx + text_width(dc, f, &label) <= r.right - ceil_w {
-                text(dc, lx, ly, f, t().dim, &label);
-            }
-        };
-        peak(&pts, &samples, false);
-        if let Some(m) = &mirror {
-            let lo: Vec<f32> = m.ring.iter().collect();
-            peak(&lo_pts, &lo, true);
-        }
-    }
-
     // The hovered sample's own dot, so the crosshair has something to point at.
     if let (Some(s), Some(i)) = (surf, hover.filter(|i| *i < pts.len())) {
         let (hx, hy) = pts[i];
@@ -1506,7 +1429,14 @@ pub fn chart(
     // Ceiling label, top-right — *on* the line it describes. Below the plot it
     // sat next to the baseline and read as though the axis bottomed out at
     // 100 %, which is the opposite of what it means.
-    if size == ChartSize::Hero {
+    //
+    // Rates do not get one. A percentage ceiling is a fact about the machine and
+    // 100 % is always true; a rate's ceiling is a decayed percentile quantised to
+    // 1/2/5, which is an implementation detail wearing the clothes of a reading.
+    // On the mirrored disk and network plots the two halves usually land on the
+    // same coarse step, so it printed the same figure twice, held it there for
+    // minutes, and read as a measurement that had got stuck.
+    if size == ChartSize::Hero && units != Units::Rate {
         if let Some(f) = font_micro {
             text_right(dc, r.right, r.top, f, t().dim, &units.fmt(ceiling));
             // A mirrored plot has two scales, so it needs two labels. Without

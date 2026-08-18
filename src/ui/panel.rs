@@ -151,6 +151,8 @@ enum Action {
     KillWatched,
     /// Expand/collapse the subprocess list in the watch view.
     ToggleSubs,
+    /// Expand/collapse the per-core grid in the CPU drill-down.
+    ToggleCores,
     /// Which metric the subprocess list sorts by and shows.
     SubMetric(Metric),
     /// End one specific subprocess by pid.
@@ -298,10 +300,6 @@ pub struct Ui {
     /// worst bug available — so it is created in exactly one place, killed the
     /// moment progress completes, and killed again when the mouse leaves.
     fade_timer: bool,
-    /// One 60-sample ring per logical core. A core cell used to be a bare
-    /// snapshot bar: 32 cores of history is a few KB and it turns each cell
-    /// into a window, which is what makes a peak tick meaningful.
-    core_hist: Vec<Ring>,
     /// Sticky y-ceilings for the four rate charts. One `f32` each; see
     /// [`util::Ceiling`]. Only the rate metrics need them — percentages pin to
     /// 100 and FPS quantises off a 60 floor.
@@ -434,6 +432,21 @@ pub struct Ui {
     /// Whether the Finished list in the activity view is open. Starts closed
     /// so the view shows live work first.
     finished_expanded: bool,
+    /// Rects that raise another program's window on a double-click, with the
+    /// pid to raise. Kept apart from `hits` because a double-click also fires
+    /// the row's ordinary click first: only rects with *no* single-click action
+    /// may appear here, or the first click would navigate away from under the
+    /// second.
+    raise_hits: Vec<(RECT, u32)>,
+    /// A transient line along the bottom of the panel — currently only "no
+    /// window to show". Cleared by `ID_NOTE`.
+    note: Option<String>,
+    /// Whether the per-core grid in the CPU drill-down is open. Starts closed:
+    /// the view is "top apps by CPU use" and the grid is the deeper dive.
+    /// Unlike [`Self::subs_expanded`] it survives navigation — cores are a
+    /// property of the machine, not of whichever app was opened last, so a
+    /// reader who wants them wants them every time.
+    cores_expanded: bool,
     /// Which metric the subprocess list sorts by and shows a column for.
     sub_metric: Metric,
     /// Indices of MCP messages expanded to their full wrapped text. Messages
@@ -681,7 +694,6 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         hero_h: 0,
         fade: None,
         fade_timer: false,
-        core_hist: Vec::new(),
         ceil_disk: Ceiling::default(),
         ceil_net: Ceiling::default(),
         ceil_disk_w: Ceiling::default(),
@@ -744,6 +756,9 @@ pub fn init(hwnd: HWND, shared: Arc<Shared>, cfg: Settings) {
         proc_roles: HashMap::new(),
         subs_expanded: false,
         finished_expanded: false,
+        cores_expanded: false,
+        raise_hits: Vec::new(),
+        note: None,
         sub_metric: Metric::Ram,
         msg_expanded: std::collections::HashSet::new(),
         agent_expanded: std::collections::HashSet::new(),
@@ -869,6 +884,27 @@ impl Ui {
                 self.pressed = true;
                 self.hover_pos = Some((x, y));
                 self.click(hwnd, x, y);
+                Some(0)
+            }
+            WM_LBUTTONDBLCLK => {
+                let x = (lparam & 0xFFFF) as i16 as i32;
+                let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+                if let Some(pid) = self
+                    .raise_hits
+                    .iter()
+                    .find(|(r, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+                    .map(|(_, p)| *p)
+                {
+                    self.raise_pid(hwnd, pid);
+                }
+                Some(0)
+            }
+            WM_TIMER if wparam == ID_NOTE => {
+                self.note = None;
+                unsafe {
+                    KillTimer(hwnd, ID_NOTE);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
                 Some(0)
             }
             WM_MOUSEMOVE => {
@@ -1148,7 +1184,7 @@ impl Ui {
         // The pause button holds the display rings still; hovering does not.
         // Freezing on hover was tried and removed: moving the pointer across a
         // drill-down would stop the graph, which is a lot of surprise to pay for
-        // a peak the plot can simply label. The peak markers do that job instead.
+        // reading one sample, which hovering the plot already gives you.
         //
         // Only the rings stop. Alerts, the MCP server, the tray icons and the
         // tooltip all read the snapshot directly, so pausing holds the picture,
@@ -1170,24 +1206,18 @@ impl Ui {
         // Advance the sticky rate ceilings exactly once per sample. Doing this
         // in the paint would decay them at the repaint rate, which hover alone
         // can drive to dozens of times a second.
-        if self.core_hist.len() != s.core_pcts.len() {
-            self.core_hist = (0..s.core_pcts.len()).map(|_| Ring::new(60)).collect();
-        }
-        for (r, pct) in self.core_hist.iter_mut().zip(s.core_pcts.iter()) {
-            r.push(*pct);
-        }
         // One ceiling per direction. A shared one keeps the halves comparable,
         // which reads well in a specification and badly on a real machine: disk
         // read runs seven times its write and download twelve times its upload,
-        // so the shared scale left the secondary flat on the midline. Both
-        // ceilings are labelled on the hero plot, so the asymmetry is stated
-        // rather than hidden.
+        // so the shared scale left the secondary flat on the midline. Neither
+        // ceiling is labelled any more, so the asymmetry is not stated in text —
+        // but an upload that fills its own half can at least be seen.
         // Scaled to the 90th percentile, not the maximum. Reported: occasional
         // MB/s bursts on an otherwise quiet link made every ordinary reading a
         // flat line, and the burst was the only thing the graph said. See
         // `Ring::high` for why the maximum cannot recover from that on its own.
-        // Brief spikes now clip at the top, where the peak label names them; a
-        // sustained transfer raises the percentile with it and does not clip.
+        // Brief spikes now clip at the top; a sustained transfer raises the
+        // percentile with it and does not clip.
         self.ceil_disk.update(self.hist_disk.high(RATE_CEIL_Q));
         self.ceil_disk_w.update(self.hist_disk_w.high(RATE_CEIL_Q));
         self.ceil_net.update(self.hist_net.high(RATE_CEIL_Q));
@@ -1479,6 +1509,65 @@ impl Ui {
         } else {
             HWND_NOTOPMOST
         }
+    }
+
+    /// Bring the double-clicked process's window to the front, and get out of
+    /// its way. `pid` first, then its siblings sharing an executable: the
+    /// process a reader picks out of a list is very often a windowless one —
+    /// a browser renderer, a browser's audio service, a service host — and the
+    /// window they meant belongs to another process of the same program.
+    ///
+    /// This cannot reach a *tab*, and no fallback here pretends otherwise: it
+    /// lands you in the browser, which is where the browser's own tab search
+    /// takes over. See `winfocus` for why that limit is real rather than lazy.
+    fn raise_pid(&mut self, hwnd: HWND, pid: u32) {
+        let name = self.snap.procs.iter().find(|p| p.pid == pid).map(|p| p.name.clone());
+        let mut cands = vec![pid];
+        if let Some(n) = &name {
+            cands.extend(
+                self.snap.procs.iter().filter(|p| p.name == *n && p.pid != pid).map(|p| p.pid),
+            );
+        }
+        if crate::winfocus::raise(&cands) {
+            // The panel is a topmost tool window. Leaving it up over the window
+            // the reader just asked for would undo the thing they asked for.
+            self.hide_panel(hwnd);
+        } else {
+            self.show_note(hwnd, "no window to show");
+        }
+    }
+
+    /// Put a line along the bottom of the panel for [`NOTE_MS`]. Used where an
+    /// action can legitimately do nothing — silence there reads as a control
+    /// that is broken rather than one that had nothing to do.
+    fn show_note(&mut self, hwnd: HWND, text: &str) {
+        self.note = Some(text.to_string());
+        unsafe {
+            SetTimer(hwnd, ID_NOTE, NOTE_MS, None);
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
+    }
+
+    fn draw_note(&mut self, dc: HDC, rc: &RECT) {
+        let Some(text) = self.note.clone() else { return };
+        let (asc, desc, _) = gdi::text_metrics(dc, self.fonts.micro);
+        let h = asc + desc + self.s(SP4);
+        let strip = RECT { left: 0, top: rc.bottom - h, right: rc.right, bottom: rc.bottom };
+        gdi::fill(dc, &strip, gdi::t().card);
+        gdi::fill(
+            dc,
+            &RECT { left: 0, top: strip.top, right: rc.right, bottom: strip.top + 1 },
+            gdi::t().line,
+        );
+        gdi::text_t(
+            dc,
+            self.s(SP4),
+            strip.top + self.s(SP2) + self.s(SP1),
+            self.fonts.micro,
+            self.s(gdi::TRACK_MICRO),
+            gdi::t().dim,
+            &text,
+        );
     }
 
     fn hide_panel(&mut self, hwnd: HWND) {
@@ -2057,6 +2146,15 @@ impl Ui {
             Action::ToggleSubs => {
                 self.subs_expanded = !self.subs_expanded;
                 self.scroll = 0;
+                self.scroll = 0;
+                unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+            }
+            Action::ToggleCores => {
+                self.cores_expanded = !self.cores_expanded;
+                // Back to the top of the list: expanding the grid pushes the
+                // rows down by its whole height, and holding the old offset
+                // would land the reader in the middle of a list they were
+                // reading from the start.
                 self.scroll = 0;
                 unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
             }
@@ -2739,6 +2837,7 @@ impl Ui {
             self.surf = bb.surface();
             gdi::fill(bb.dc, &rc, gdi::t().bg);
             self.hits.clear();
+            self.raise_hits.clear();
             match self.view {
                 View::Main => self.draw_main(bb.dc, &rc),
                 View::Drill(m) => self.draw_drill(bb.dc, &rc, m),
@@ -2751,6 +2850,10 @@ impl Ui {
                 View::Activity => self.draw_activity(bb.dc, &rc),
                 View::SettingsPage(p) => self.draw_settings_page(bb.dc, &rc, p),
             }
+            // Last, and over everything: a note is a reply to something the
+            // reader just did, so it cannot be a view's business to leave room
+            // for it.
+            self.draw_note(bb.dc, &rc);
             // Dropped before the buffer is, so no chart can hold a pointer
             // into a DIB that has been deleted.
             self.surf = None;
@@ -3211,15 +3314,11 @@ impl Ui {
             let mirror = match name.as_str() {
                 "disk" => Some(gdi::Mirror {
                     ring: &self.hist_disk_w,
-                    label_hi: "Read",
-                    label_lo: "Write",
                     color: gdi::acc().disk_w,
                     ceiling: self.ceil_disk_w.peek(),
                 }),
                 "net" => Some(gdi::Mirror {
                     ring: &self.hist_net_tx,
-                    label_hi: "Down",
-                    label_lo: "Up",
                     color: gdi::acc().net_tx,
                     ceiling: self.ceil_net_tx.peek(),
                 }),
@@ -3238,7 +3337,6 @@ impl Ui {
                 None,
                 chart_units(scale),
                 mirror,
-                false,
             );
             self.hits.push((row, action));
             y += self.s(ROW_METRIC);
@@ -3937,8 +4035,9 @@ impl Ui {
     }
 
     /// The hero chart: one plate carrying the metric's name, its current value
-    /// at the display step, the window, the ceiling, a peak marker and — on
-    /// hover — the sample under the cursor with its age.
+    /// at the display step, the window, a ceiling label where the ceiling means
+    /// something (§`Units`) and — on hover — the sample under the cursor with
+    /// its age.
     ///
     /// The age is relative on purpose. `23s ago` answers the question a monitor
     /// is asked; `14:22:07` does not.
@@ -3949,24 +4048,31 @@ impl Ui {
         let (d_asc, d_desc, _) = gdi::text_metrics(dc, self.fonts.display);
         let (l_asc, l_desc, _) = gdi::text_metrics(dc, self.fonts.label);
         let (m_asc, m_desc, _) = gdi::text_metrics(dc, self.fonts.micro);
-        let head_h = self.s(SP3) + (l_asc + l_desc) + self.s(SP1) + (d_asc + d_desc);
+        // Top pad matches the side gutter — SP3 above a label whose left edge
+        // sits at SP4 read as the card leaning up and left.
+        let head_h = self.s(SP4) + (l_asc + l_desc) + self.s(SP2) + (d_asc + d_desc);
         let plot_h = self.s(HERO_PLOT_H);
         // Disk and Network carry a second figure under the first, so the plate
         // is a line taller for them.
         let two_way = matches!(h, Hero::M(Metric::Disk) | Hero::M(Metric::Net));
-        let second_line = if two_way { self.s(SP1) + (m_asc + m_desc) } else { 0 };
+        // SP3, not SP1: at two pixels the write figure clung to the read figure
+        // above it and the pair read as one wrapped string rather than as two
+        // readings.
+        let second_line = if two_way { self.s(SP3) + (m_asc + m_desc) } else { 0 };
         let plate_h = head_h
             + second_line
-            + self.s(SP4)
+            // The card's one real hierarchy break — the number now, above the
+            // history behind it.
+            + self.s(SP5)
             + plot_h
-            + self.s(SP1)
+            + self.s(SP3)
             + (m_asc + m_desc)
-            + self.s(SP3);
+            + self.s(SP4);
         self.hero_h = plate_h + self.s(SP4);
         let plate = RECT { left: pad, top: y, right: rc.right - pad, bottom: y + plate_h };
         gdi::card(dc, &plate, gdi::t().card, gdi::t().line, self.s(RADIUS));
 
-        let plot_top = plate.top + head_h + second_line + self.s(SP4);
+        let plot_top = plate.top + head_h + second_line + self.s(SP5);
         let plot = RECT {
             left: plate.left + self.s(SP4),
             top: plot_top,
@@ -3995,7 +4101,7 @@ impl Ui {
         // to the live value the moment it leaves. There is deliberately no way to
         // pin a sample: pinning meant the headline number stopped being the
         // current one, and the current one is what the panel is for. Freezing the
-        // graph on hover already covers reading a peak without it sliding away,
+        // graph on hover already covers reading a sample without it sliding away,
         // which was pinning's only real job. `hover_pos` is already tracked and
         // already forces a repaint on change, so this costs nothing to drive.
         let hit = self
@@ -4004,7 +4110,7 @@ impl Ui {
             .and_then(|(hx, _)| gdi::chart_hit(&plot, cap, held, hx));
         let shown = hit.and_then(|i| ring.iter().nth(i)).unwrap_or(latest);
 
-        // The second direction at the same sample, so a pinned peak reports both
+        // The second direction at the same sample, so the readout reports both
         // halves of the chart rather than only the half that happens to be on
         // top. Read straight from the mirrored ring, so the two figures always
         // describe the same instant.
@@ -4046,7 +4152,7 @@ impl Ui {
         gdi::text_t(
             dc,
             plate.left + self.s(SP4),
-            plate.top + self.s(SP3),
+            plate.top + self.s(SP4),
             self.fonts.label,
             self.s(gdi::TRACK_LABEL),
             accent,
@@ -4060,7 +4166,7 @@ impl Ui {
             Scale::Fps => format!("{:.0}", shown),
             Scale::Rate | Scale::Fixed(_) => format_rate(shown as u64),
         };
-        let vy = plate.top + self.s(SP3) + (l_asc + l_desc) + self.s(SP1);
+        let vy = plate.top + self.s(SP4) + (l_asc + l_desc) + self.s(SP2);
         gdi::text(dc, plate.left + self.s(SP4), vy, self.fonts.display, gdi::t().text, &vs);
         // The word naming the primary direction sits on the big figure's
         // baseline, the same way a metric row's unit does.
@@ -4082,7 +4188,7 @@ impl Ui {
         // so the readout maps onto the chart without needing a legend.
         if let Some((v2, u2, c2)) = second {
             let s2 = format_rate(v2 as u64);
-            let y2 = vy + (d_asc + d_desc) + self.s(SP1);
+            let y2 = vy + (d_asc + d_desc) + self.s(SP3);
             gdi::text(dc, plate.left + self.s(SP4), y2, self.fonts.micro, c2, &s2);
             gdi::text_t(
                 dc,
@@ -4101,7 +4207,7 @@ impl Ui {
         gdi::text_right_t(
             dc,
             plate.right - self.s(SP4),
-            plate.top + self.s(SP3),
+            plate.top + self.s(SP4),
             self.fonts.micro,
             self.s(gdi::TRACK_MICRO),
             gdi::t().dim,
@@ -4126,30 +4232,31 @@ impl Ui {
             match h {
                 Hero::M(Metric::Disk) => Some(gdi::Mirror {
                     ring: &self.hist_disk_w,
-                    label_hi: "Read",
-                    label_lo: "Write",
                     color: gdi::acc().disk_w,
                     ceiling: self.ceil_disk_w.peek(),
                 }),
                 Hero::M(Metric::Net) => Some(gdi::Mirror {
                     ring: &self.hist_net_tx,
-                    label_hi: "Down",
-                    label_lo: "Up",
                     color: gdi::acc().net_tx,
                     ceiling: self.ceil_net_tx.peek(),
                 }),
                 _ => None,
             },
-            !matches!(h, Hero::M(Metric::Audio)),
         );
 
-        // Window and ceiling labels. The window is derived, not hardcoded —
-        // this is the first time the panel says what its own graphs cover.
+        // Window label. Derived, not hardcoded — this is the first time the
+        // panel says what its own graphs cover.
+        //
+        // Bottom-right, not bottom-left. On a mirrored plot the lower half's
+        // direction label owned the bottom-left corner, and `60s` two pixels
+        // under it made one four-line stack of dim micro text in the corner
+        // where the write trace also runs. The right-hand end came free when the
+        // rate charts stopped labelling a ceiling.
         let secs = cap as u32 * interval / 1000;
-        gdi::text_t(
+        gdi::text_right_t(
             dc,
-            plot.left,
-            plot.bottom + self.s(SP1),
+            plot.right,
+            plot.bottom + self.s(SP3),
             self.fonts.micro,
             self.s(gdi::TRACK_MICRO),
             gdi::t().dim,
@@ -4288,67 +4395,103 @@ impl Ui {
             y += self.s(16);
         }
 
-        // Per-core grid at the top of the CPU drill-down.
+        // Per-core grid, behind a disclosure and closed by default. It used to
+        // be open always, under a heading, with a line of instructional text
+        // below it — three rows of bars, a placeholder sentence and the app list
+        // all inside about ten pixels of each other. The view is "top apps by
+        // CPU use"; the grid is the deeper dive, so it now costs one row until
+        // it is asked for.
         if metric == Metric::Cpu && !snap.core_pcts.is_empty() {
             let cores = snap.core_pcts.clone();
-            self.heading(dc, pad, y, &format!("CPU CORES · {}", cores.len()));
-            y += self.s(SP5);
-            let cols: i32 = if cores.len() <= 8 { 2 } else if cores.len() <= 32 { 4 } else { 8 };
-            let gap = self.s(SP3);
-            let bar_w = (rc.right - rc.left - 2 * pad - (cols - 1) * gap) / cols;
-            let mut readout: Option<String> = None;
-            for (i, pct) in cores.iter().enumerate() {
-                let col = (i as i32) % cols;
-                let row_i = (i as i32) / cols;
-                let bx = pad + col * (bar_w + gap);
-                let by = y + row_i * self.s(SP4);
-                let r = RECT { left: bx, top: by, right: bx + bar_w, bottom: by + self.s(SP3) };
-                gdi::bar(dc, &r, pct / 100.0, gdi::acc().cpu);
-                // One pixel per core that turns a snapshot into a window.
-                // Only worth a mark when the peak is meaningfully above the
-                // current fill, and in `dim` rather than `text`: at full ink on
-                // a mostly-empty bar it read as a defect rather than a marker.
-                let peak = self.core_hist.get(i).map(|h| h.max()).unwrap_or(0.0);
-                if peak > pct + 4.0 {
-                    let px = r.left + (((r.right - r.left) as f32) * (peak / 100.0).min(1.0)) as i32;
-                    let tick = RECT {
-                        left: px.min(r.right - 1),
-                        top: r.top,
-                        right: (px + 1).min(r.right),
-                        bottom: r.bottom,
-                    };
-                    gdi::fill(dc, &tick, gdi::t().dim);
-                }
-                // Hover names the core. The grid carries no per-cell labels
-                // otherwise: at four to eight columns there is no room for
-                // sixteen numbers, and unlabelled rules would be decoration.
-                let hit = RECT {
-                    left: r.left,
-                    top: r.top - self.s(SP1),
-                    right: r.right,
-                    bottom: r.bottom + self.s(SP1),
-                };
-                if self.hovered(&hit) {
-                    readout =
-                        Some(format!("core {} · {:.0}% now · {:.0}% peak in 60s", i, pct, peak));
-                }
-                // The cell has to be a hit for the readout to work at all:
-                // WM_MOUSEMOVE only repaints when the hovered hit *index*
-                // changes, so cells outside `hits` never triggered one and the
-                // readout stayed on its placeholder however you moved.
-                self.hits.push((hit, Action::HoverCore));
-            }
-            let rows_n = (cores.len() as i32 + cols - 1) / cols;
-            y += rows_n * self.s(SP4) + self.s(SP1);
-            gdi::text_t(
+            y += self.s(SP4);
+            let (b_asc, _, _) = gdi::text_metrics(dc, self.fonts.body);
+            let (m_asc, _, _) = gdi::text_metrics(dc, self.fonts.micro);
+            let hrow_y = y;
+            let hrow =
+                RECT { left: pad, top: y, right: rc.right - pad, bottom: y + self.s(ROW_LIST) };
+            self.hover_fill(dc, &hrow, gdi::t().card);
+            // Same disclosure row as the watch view's "Processes (n)": a reader
+            // who has opened one knows what this is. The label is body text, not
+            // the dim tracked heading the section used to carry — a heading that
+            // responds to a click is a control wearing the wrong clothes.
+            gdi::disclosure(
                 dc,
-                pad,
-                y,
-                self.fonts.micro,
-                self.s(gdi::TRACK_MICRO),
+                pad + self.s(11),
+                y + self.s(11),
+                self.s(8),
+                self.s(2),
                 gdi::t().dim,
-                readout.as_deref().unwrap_or("hover a core for its number and peak"),
+                self.cores_expanded,
             );
+            gdi::text(
+                dc,
+                pad + self.s(24),
+                y + self.s(SP2),
+                self.fonts.body,
+                gdi::t().text,
+                &format!("CPU cores ({})", cores.len()),
+            );
+            self.hits.push((hrow, Action::ToggleCores));
+            y += self.s(ROW_LIST);
+
+            let mut readout: Option<String> = None;
+            if self.cores_expanded {
+                y += self.s(SP4);
+                let cols: i32 =
+                    if cores.len() <= 8 { 2 } else if cores.len() <= 32 { 4 } else { 8 };
+                let gap = self.s(SP3);
+                let bar_w = (rc.right - rc.left - 2 * pad - (cols - 1) * gap) / cols;
+                let bar_h = self.s(SP3);
+                // Stride SP5 against an SP3 bar: an 8 px gap between rows, the
+                // same air as between columns. At SP4 the rows were 4 px apart
+                // and the grid read as one hatched block rather than as cores.
+                let stride = self.s(SP5);
+                for (i, pct) in cores.iter().enumerate() {
+                    let col = (i as i32) % cols;
+                    let row_i = (i as i32) / cols;
+                    let bx = pad + col * (bar_w + gap);
+                    let by = y + row_i * stride;
+                    let r = RECT { left: bx, top: by, right: bx + bar_w, bottom: by + bar_h };
+                    gdi::bar(dc, &r, pct / 100.0, gdi::acc().cpu);
+                    // Hover names the core. The grid carries no per-cell labels
+                    // otherwise: at four to eight columns there is no room for
+                    // sixteen numbers, and unlabelled rules would be decoration.
+                    let hit = RECT {
+                        left: r.left,
+                        top: r.top - self.s(SP1),
+                        right: r.right,
+                        bottom: r.bottom + self.s(SP1),
+                    };
+                    if self.hovered(&hit) {
+                        readout = Some(format!("core {} · {:.0}%", i, pct));
+                    }
+                    // The cell has to be a hit for the readout to work at all:
+                    // WM_MOUSEMOVE only repaints when the hovered hit *index*
+                    // changes, so cells outside `hits` never triggered one and
+                    // the readout stayed on its placeholder however you moved.
+                    self.hits.push((hit, Action::HoverCore));
+                }
+                let rows_n = (cores.len() as i32 + cols - 1) / cols;
+                y += (rows_n - 1) * stride + bar_h;
+            }
+            // The hovered core's number, right-aligned on the disclosure row and
+            // sharing its baseline. It replaces a permanent "hover a core for
+            // its number" line: that sentence was instructions rather than data,
+            // it was wrong the moment anyone followed it, and it sat one line
+            // above the app list with nothing to separate them. Drawn after the
+            // grid because that is where the hover is discovered; the row is a
+            // fixed height either way, so nothing reflows as the pointer moves.
+            if let Some(r) = &readout {
+                gdi::text_right_t(
+                    dc,
+                    hrow.right - self.s(SP3),
+                    hrow_y + self.s(SP2) + (b_asc - m_asc),
+                    self.fonts.micro,
+                    self.s(gdi::TRACK_MICRO),
+                    gdi::t().dim,
+                    r,
+                );
+            }
             y += self.s(SP5);
         }
 
@@ -4744,6 +4887,23 @@ impl Ui {
             gdi::t().dim,
             &status,
         );
+        // The app as a whole, for the same double-click. An app with one
+        // process shows no process list at all, so without this there would be
+        // nothing to double-click on the very apps where the answer is
+        // unambiguous. The status line is the only band in this view with no
+        // single-click action of its own.
+        if let Some(pid) = self.snap.procs.iter().find(|p| p.name == name).map(|p| p.pid) {
+            let (m_asc, m_desc, _) = gdi::text_metrics(dc, self.fonts.micro);
+            self.raise_hits.push((
+                RECT {
+                    left: pad,
+                    top: y - self.s(SP1),
+                    right: rc.right - pad,
+                    bottom: y + m_asc + m_desc + self.s(SP1),
+                },
+                pid,
+            ));
+        }
         y += self.s(SP6);
 
         let a = watch_sums(&self.snap.procs, &name);
@@ -4885,21 +5045,16 @@ impl Ui {
                 match ring_idx {
                     3 => Some(gdi::Mirror {
                         ring: &self.watch_rings[6],
-                        label_hi: "Read",
-                        label_lo: "Write",
                         color: gdi::acc().disk_w,
                         ceiling: self.ceil_watch_disk_w.peek(),
                     }),
                     4 => Some(gdi::Mirror {
                         ring: &self.watch_rings[7],
-                        label_hi: "Down",
-                        label_lo: "Up",
                         color: gdi::acc().net_tx,
                         ceiling: self.ceil_watch_net_tx.peek(),
                     }),
                     _ => None,
                 },
-                false,
             );
             y += self.s(ROW_METRIC);
         }
@@ -5041,6 +5196,18 @@ impl Ui {
                         bottom: ry + self.s(20),
                     };
                     self.hits.push((kill_hit, Action::KillPid(p.pid)));
+                    // Double-click the row — not the × — to go to that
+                    // process's window. The row body carries no single-click
+                    // action, which is exactly why it can carry this one.
+                    self.raise_hits.push((
+                        RECT {
+                            left: pad,
+                            top: (ry - self.s(2)).max(list_top),
+                            right: kx - self.s(6),
+                            bottom: ry + self.s(20),
+                        },
+                        p.pid,
+                    ));
                 }
                 unsafe { RestoreDC(dc, saved) };
                 self.scrollbar(dc, rc, list_top, labelled.len() as i32 * row_h);
@@ -5838,9 +6005,10 @@ fn metric_label(name: &str) -> (&'static str, u32, gdi::Glyph) {
     }
 }
 
-/// How a chart should format its own peak and ceiling labels, from the scale
-/// policy that produced the ceiling. Keeping the two derived from one value is
-/// what stops a rate's peak label printing a raw byte count.
+/// How a chart should format its own ceiling label, from the scale policy that
+/// produced the ceiling. Keeping the two derived from one value is what stopped
+/// a rate's ceiling label printing a raw byte count — and now also decides which
+/// charts label a ceiling at all: [`gdi::Units::Rate`] does not.
 fn chart_units(scale: Scale) -> gdi::Units {
     match scale {
         Scale::Percent => gdi::Units::Percent,
@@ -5869,6 +6037,10 @@ const CHROME_GLYPH: i32 = 17;
 const RATE_CEIL_Q: f32 = 0.9;
 const ID_FADE: usize = 1;
 const ID_BALLOON: usize = 2;
+const ID_NOTE: usize = 3;
+/// How long a note stays up. Long enough to read four words, short enough that
+/// it is gone before the reader wonders how to dismiss it.
+const NOTE_MS: u32 = 2200;
 /// Windows shows a tray balloon for around five seconds, so anything much
 /// shorter than this would replace a notification the user is still reading.
 const BALLOON_MS: u32 = 6000;

@@ -24,6 +24,8 @@ mod rules;
 mod sampler;
 #[cfg(windows)]
 mod ui;
+#[cfg(windows)]
+mod winfocus;
 
 #[cfg(not(windows))]
 fn main() {
@@ -100,6 +102,10 @@ fn main() {
         wc.lpszClassName = class.as_ptr();
         wc.hCursor = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
         wc.hIcon = LoadIconW(wc.hInstance, 1 as *const u16); // embedded app icon
+        // Without CS_DBLCLKS a double-click arrives as two separate
+        // WM_LBUTTONDOWN pairs, so a row that opens a view would open it twice
+        // rather than raising the app's window.
+        wc.style = CS_DBLCLKS;
         RegisterClassW(&wc);
 
         let hwnd = CreateWindowExW(

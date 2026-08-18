@@ -52,7 +52,7 @@ almost every segment is a diagonal, and every diagonal is a staircase.
 | name | size (logical) | where | anatomy |
 |---|---|---|---|
 | **Row** | 120 × 32 | metric rows in `draw_main` (`panel.rs:2456`) and `draw_process` (`panel.rs:3605`) | trace, wash, baseline, head dot |
-| **Hero** | full width × 96 | top of every drill-down and the watch view | + gridlines, ceiling label, window label, hover crosshair, peak marker, range chips |
+| **Hero** | full width × 96 | top of every drill-down and the watch view | + gridlines, ceiling label (percent and fps only), window label, hover crosshair, range chips |
 | **Micro** | 56 × 14 | per-core cells, widget segments (future) | trace + baseline only |
 
 All three share one routine and one options struct:
@@ -118,9 +118,9 @@ let ceiling  = nice(self.ceil_raw);
 > samples that excludes the top six, so a burst has to last about a tenth of the
 > window before it lifts the axis — the line between "a spike happened" and "this
 > is the traffic now". A sustained transfer raises the percentile with it and never
-> clips; a brief spike clips at the top, where the peak marker names its true
-> value. Clipping the exception is better than hiding the rule, and the exception
-> is the reading whose exact height matters least.
+> clips; a brief spike clips at the top, and hovering it names its true value.
+> Clipping the exception is better than hiding the rule, and the exception is the
+> reading whose exact height matters least.
 
 The trace holds still while traffic varies, and the ceiling steps by a clean
 factor of 2 or 2.5 when the typical order of magnitude genuinely changes — roughly once
@@ -129,14 +129,32 @@ of 7 % per tick produces a ceiling change only when it crosses a step boundary.
 
 ### Ceiling label
 
-Top-right of the plot, `micro` in `dim`, formatted by `Unit`:
-`100%` · `50 MB/s` · `144 fps` · `16 GB`. On a `Row` chart the ceiling label is
-omitted — the row's value text carries the number, and the fixed 100 % ceiling
-means the percent rows need no label at all.
+Top-right of the plot, `micro` in `dim`, formatted by `Unit`: `100%` · `144 fps`
+· `16 GB`. On a `Row` chart it is omitted — the row's value text carries the
+number, and the fixed 100 % ceiling means the percent rows need no label at all.
+
+**Rates carry no ceiling label.** `Units::Rate` is excluded, which is Disk and
+Network everywhere they appear.
+
+> **Revised after implementation.** Reported from the disk drill-down: two
+> identical `1.9 MB/s` labels, one per half, that never changed. Both parts of
+> that are the design working as specified — the halves land on the same
+> quantised step, and a step only moves when the decayed percentile crosses a
+> boundary — and together they produce a figure that looks like a stuck reading
+> sitting beside the live one, in the same size and colour. A percent ceiling
+> states a fact about the machine (`100%` is always true); a rate ceiling states
+> the output of a decay constant and a 1/2/5 quantiser, which is a fact about
+> this program. Only the first is worth a label.
+>
+> Note also that `nice()` quantises in decimal while `format_rate` divides by
+> 1024², so the "round" steps printed as `953 KB/s`, `1.9 MB/s`, `4.8 MB/s`. That
+> is invisible now that no rate ceiling is drawn, and it would have to be fixed
+> first if one ever comes back.
 
 ### Window label
 
-Bottom-left of the hero plot, `micro` in `mute`: `60s` — derived, not hardcoded:
+Bottom-**right** of the hero plot, `micro` in `mute`: `60s` — derived, not
+hardcoded:
 
 ```rust
 let secs = ring.capacity() as u32 * self.cfg.interval_ms / 1000;
@@ -218,26 +236,19 @@ panel has no room to label vertical rules, and unlabelled ones are decoration.
 left-hand tick column would cost 32 logical px of a 312 px plot for information
 that is redundant with a fixed 100 % ceiling and with the hover readout.
 
-**One peak marker per series on a hero chart** — so one on a single-series plot
-and two on a mirrored one, one per half. A 3 px tick in `dim` at that series'
-maximum `(x, y)`, with `micro dim` text `peak 82%` placed to whichever side has
-room; the lower half's label hangs below its point so the two cannot write over
-each other around the midline.
+**No peak marker.** A percent or fps hero chart labels its ceiling and nothing
+else on the plot; a rate chart labels nothing at all. The height of any one
+sample is read by hovering it (§6).
 
-> **Revised after implementation.** This read "one peak marker per hero chart",
-> and the mirrored charts were built with no marker at all on the reasoning that a
-> plot already carrying two direction labels should not take a third. That was
-> backwards. The peak is the entire reason to look at a disk or network graph, and
-> with each half on its own ceiling an unlabelled high point says nothing about
-> how high it actually was. It also became the answer to a different problem:
-> freezing the graph on hover was tried so a peak could be read without sliding
-> away, and removed because stopping the graph whenever the pointer crosses it is
-> far too much surprise for the benefit. A labelled peak needs no interaction at
-> all.
-
-Suppressed when the peak is the newest sample (the head dot already says so) or
-when the window is flat (§6). This is the only direct label on the chart, and it
-works *because* it is the only one.
+> **Revised after implementation.** A peak tick with a `peak 82%` label beside it
+> shipped first, then grew: one per half on the mirrored charts, then a fixed
+> label slot after the moving label collided with the direction labels and the
+> ceilings. Each fix was correct and the total was still wrong. On a plot 96 px
+> tall the label rows are the scarce thing, and a number nobody asked for was
+> occupying them on every drill-down at once — a figure from some earlier moment
+> sitting beside the current one, in the same size and colour, with only the word
+> "peak" to separate them. The trace already shows where the high point was, and
+> hovering it says how high. The marker is gone: label, number and tick.
 
 ---
 
@@ -246,14 +257,29 @@ works *because* it is the only one.
 The hero chart's header line, above the plot:
 
 ```
-CPU                                    41.7%   now
-──────────────────────────────────────────────────
+PROCESSOR                                       now
+41.7%
+                                              100%
                                      ╭──╮
               ╭─╮        ╭───╮      ╭╯  ╰──╮
    ╭──────────╯ ╰────────╯   ╰──────╯      ╰────●
    ──────────────────────────────────────────────
-   60s                                       100%
+                                              60s
 ```
+
+The plate's vertical rhythm, top to bottom: `SP4` · metric label · `SP2` ·
+the figure in `display` · [`SP3` · the second direction in `micro`] · `SP5` ·
+plot · `SP3` · window label · `SP4`.
+
+> **Revised after implementation.** Every one of those steps was one rank
+> tighter — `SP3` top pad under an `SP4` side gutter, `SP1` between the label
+> and the figure, `SP1` again between the read figure and the write figure
+> below it, `SP1` between the plot and `60s`. Each was defensible alone and
+> together they produced a card with no internal grouping at all: on the disk
+> plate the two figures read as one wrapped string. `SP5` between the figures
+> and the plot is the one break that matters — the reading now, above the
+> history behind it — and the rest are one step apart so the ranks are
+> distinguishable.
 
 On hover it becomes the sample under the cursor:
 
@@ -289,7 +315,7 @@ Three mechanisms, in order of how much they do:
    low flat trace reads as low rather than as "the middle of something".
 3. **The flat case is named.** When
    `window_max - window_min < ceiling * 0.02` and the chart is a hero, suppress
-   the peak marker and the gridline labels and print nothing extra. The picture
+   the gridline labels and print nothing extra. The picture
    — a straight line just above a baseline, under a 100 % ceiling — is already
    complete. Do not add a "flat" badge; the chart is not broken, the machine is
    idle.
@@ -318,18 +344,28 @@ half on its own sticky ceiling**.
 > about seven times its write and download about twelve times its upload, and a
 > row chart gives each half fifteen pixels. The secondary drew one or two pixels
 > off the midline and was reported, correctly, as looking flat at zero. Each half
-> now scales to its own ceiling and **the hero plot labels both**, which puts the
-> asymmetry on the screen rather than hiding it inside a scale nobody can read.
-> Comparability was a real property and it has been given up deliberately; the
-> two ceiling labels are what replaces it.
+> now scales to its own ceiling, which puts the asymmetry on the screen rather
+> than hiding it inside a scale nobody can read. Comparability was a real
+> property and it has been given up deliberately.
+>
+> **Revised again.** The two ceiling labels were what replaced it, and they have
+> since gone with every other rate ceiling (§3): printed side by side they were
+> usually the same number, so they documented the asymmetry least often exactly
+> when it was largest enough to matter and read as a stuck reading the rest of
+> the time. What replaces comparability now is that each half is *visible* —
+> an upload at a twelfth of the download still fills its own space — and the
+> hover readout, which gives both directions at one instant in figures that are
+> actually comparable because they share a sample.
 
 ```
-        Down                                 12.4 MB/s
+   12.4 MB/s down                                   ← on the plate, in `net`
+   0.9 MB/s up                                      ← on the plate, in `net_tx`
+
         ╭───╮      ╭──╮
    ─────╯   ╰──────╯  ╰───────────────●            ← down, accent
    ═══════════════════════════════════════          ← midline, `line`
-   ────╮  ╭─────────╮   ╭───────────────●          ← up, mix(accent, dim, 0.45)
-        Up                                 0.9 MB/s
+   ────╮  ╭─────────╮   ╭───────────────●          ← up, `net_tx`
+                                             60s   ← window label, bottom-right
 ```
 
 - Down uses `net` at full strength; up uses **its own hue**, `net_tx`
@@ -344,15 +380,25 @@ half on its own sticky ceiling**.
   > both sit in gaps the seven metric accents leave — so neither can be misread
   > as another metric inside a row that already names its own. All four clear
   > 4.5:1 on `card` in both themes.
-- Two permanent direct labels, `Down` and `Up`, in `micro mute` at the left of
-  each half. **Never colour alone.**
+- Two direct labels, `Down` and `Up`, naming the halves. **Never colour alone.**
+
+  > **Revised after implementation.** They were drawn inside the plot, at the
+  > top-left and bottom-left corners. Both corners are places the traces go: on a
+  > busy window the download trace ran through the word `Down`, and `60s` under
+  > the bottom-left corner made a stack of three dim micro strings in the space
+  > the upload trace was also using. The rule survives, the position moved — the
+  > hero plate above the plot prints both figures, each with its direction
+  > spelled out (`153.9 KB/s read`, `207.1 KB/s write`) and set in that half's
+  > own trace colour, one above the other in the order the halves appear. That
+  > is a direct label with room to be read. Inside the plot there is now nothing
+  > but data.
 - Each half gets its own wash, gradient running away from the midline.
 - Replaces the current `"↓ {} · ↑ {}"` value string (`panel.rs:2412`), which
   puts two numbers where a shape belongs.
 
 ### Disk — read versus write
 
-Identical treatment, labels `Read` / `Write`, accent `disk`. Replaces
+Identical treatment, `read` / `write` named on the plate, accent `disk`. Replaces
 `"R {} · W {}"` (`panel.rs:2405`).
 
 ### CPU cores
@@ -360,16 +406,36 @@ Identical treatment, labels `Read` / `Write`, accent `disk`. Replaces
 The existing bar grid (`panel.rs:3240-3257`) is the right form for 336 px and up
 to 64 cores; a small-multiples grid of sparklines is unreadable below ~90 px per
 cell and 32 cells would be 190 px of vertical space. **Keep the grid, restyle
-it**, and add the one thing it lacks — history:
+it**, and put it behind a disclosure:
 
-- Bars 8 logical px tall (was `s(8)` ✓), 4 px radius, **2 px surface gap**
-  between neighbours (currently `s(6)`, which reads as a gap between *groups*).
+- A `ROW_LIST` disclosure row, `CPU cores (22)` in `body`, closed by default —
+  the same control as the watch view's `Processes (n)`. The state survives
+  navigation: cores are a property of the machine, not of the last app opened.
+- Bars 8 logical px tall, 4 px radius, `SP3` between columns and `SP5` stride
+  between rows — an 8 px gap each way, so the grid reads as cores rather than as
+  one hatched block.
 - Track in `track`, fill in `cpu`.
-- **A 1 px peak tick** in `mix(cpu, text, 0.4)` at each core's maximum over the
-  last 60 samples. One `u8` ring of 60 per core: 32 cores = **1.9 KB**. That
-  single pixel per core turns a snapshot into a window, and it is the whole
-  reason the grid is worth keeping.
-- Hovering a bar shows `core 12 · 74% · peak 98%` in the section header.
+- Hovering a bar shows `core 12 · 74%` right-aligned **on the disclosure row**,
+  sharing its baseline.
+
+> **Revised after implementation.** The grid shipped always-open under a dim
+> section heading, with `hover a core for its number` on a line below it. Three
+> things were wrong at once and they compounded: the heading's own gap was
+> `SP5` measured from the text's *top*, so about two pixels of air separated it
+> from the bars; the bar rows were `SP4` apart on an `SP3` bar, so 4 px; and the
+> instruction line then sat 4 px above the first app row. The section had no
+> edges. Closing it by default is the larger fix — this view is "top apps by CPU
+> use", and the grid is a deeper dive that should cost a click, not a third of
+> the panel. The instruction line is gone outright: it was text that told you
+> what to do rather than telling you anything, and it was wrong the instant
+> anyone followed it. Its content now appears where the answer belongs, on the
+> row that names the section, in a slot that reserves no space when empty.
+
+> **Revised after implementation.** A 1 px peak tick per core, over a 60-sample
+> ring, shipped here too and went with the hero marker for the same reason: the
+> grid answers "which cores are busy now", and a second, older number layered
+> into the same eight pixels made that harder to read, not easier. The rings are
+> gone with it.
 - Columns: 2 up to 8 cores, 4 up to 32, 8 above — unchanged from
   `panel.rs:3244`.
 
@@ -430,9 +496,8 @@ resets with the process, like everything else in `Ui`.
 
 ## 10b. Per-core, and the question it cannot answer
 
-Each core cell carries a 60-sample ring and a 1 px peak tick, and hovering one
-names it: `core 5 · 42% now · 91% peak in 60s`. The grid stays otherwise
-unlabelled — at four to eight columns there is no room for sixteen numbers, and
+Each core cell is a bare snapshot bar, and hovering one names it:
+`core 5 · 42%`. The grid stays otherwise unlabelled — at four to eight columns there is no room for sixteen numbers, and
 unlabelled rules would be decoration.
 
 **Per-core usage *per process* is not offered, and that is a decision.** Windows
@@ -477,7 +542,7 @@ Per full panel paint, dark theme, 336 × 620 logical at 100 % DPI.
 | element | count | GDI calls | pixel writes |
 |---|---:|---:|---:|
 | Row chart: plate + wash + baseline + trace + dot | 7 | ~9 each | ~1 400 (fill) + ~330 (blend) each |
-| Hero chart: + 3 gridlines, 2 labels, peak marker | 1 | ~20 | ~30 000 (fill) + ~1 000 (blend) |
+| Hero chart: + 3 gridlines, 2 labels | 1 | ~20 | ~30 000 (fill) + ~1 000 (blend) |
 | Core grid, 16 cores | 1 | 32 | ~2 000 |
 | Hover crosshair + readout | 1 | 5 | ~200 |
 
@@ -489,7 +554,7 @@ writes. At 0.5 Hz plus hover, on any machine that can run Windows 11, this is
 not measurable.
 
 The one thing to watch is **hover repaints on the core grid at 64 cores** —
-every mouse move repaints 64 bars and 64 peak ticks. If that ever shows up,
+every mouse move repaints 64 bars. If that ever shows up,
 the fix is to invalidate only the chart's rect on a hover-position change
 rather than the whole client area (`panel.rs:688` currently passes `null`), not
 to make the chart cheaper.
@@ -504,6 +569,6 @@ to make the chart cheaper.
 | `ring.max()` as ceiling (`panel.rs:2400`, `:2407`, `:2414`, `:3595-3599`) | the ceiling policy in §3 |
 | `"R {} · W {}"` (`panel.rs:2405`) | mirrored disk chart |
 | `"↓ {} · ↑ {}"` (`panel.rs:2412`) | mirrored network chart |
-| per-core `gdi::bar` grid (`panel.rs:3253`) | same grid, rounded, gapped, with peak ticks |
+| per-core `gdi::bar` grid (`panel.rs:3253`) | same grid, rounded, gapped |
 | `gdi::bar` for drives (`gdi.rs:428`) | same signature, 2 px radius, `warn` above 85 % and `danger` above 95 % |
-| nothing | hover readout, window label, peak marker, 1 h range |
+| nothing | hover readout, window label, 1 h range |
